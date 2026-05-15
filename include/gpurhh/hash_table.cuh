@@ -20,6 +20,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include <cooperative_groups.h>
+#include <cuda/atomic>
 #include <cuda_runtime.h>
 
 namespace gpurhh {
@@ -45,10 +47,10 @@ namespace gpurhh {
 // isn't a repeated-byte pattern. Leaving the choice to the user avoids
 // committing to any of those compromises.
 //
-// The trait exposes both `value` (the key value itself) and `memset_byte`
-// (the byte that, repeated, produces that value). `HashTable`'s
-// constructor uses `memset_byte` to init the slot array with one
-// cudaMemset call.
+// The trait exposes both `key` (the empty-key value itself) and
+// `memset_byte` (the byte that, repeated, produces that value).
+// `HashTable`'s constructor uses `memset_byte` to init the slot array
+// with one cudaMemset call.
 template <class Key>
 struct default_empty_key {
     static_assert(std::is_unsigned_v<Key>,
@@ -57,14 +59,14 @@ struct default_empty_key {
                   "or other key types");
 
     static constexpr unsigned char memset_byte = 0xFFu;
-    static constexpr Key           value       = static_cast<Key>(~Key{});
+    static constexpr Key           key         = static_cast<Key>(~Key{});
 };
 
 // Compile-time verification for the supported integer types.
-static_assert(default_empty_key<std::uint8_t >::value == 0xFFu);
-static_assert(default_empty_key<std::uint16_t>::value == 0xFFFFu);
-static_assert(default_empty_key<std::uint32_t>::value == 0xFFFFFFFFu);
-static_assert(default_empty_key<std::uint64_t>::value == 0xFFFFFFFFFFFFFFFFull);
+static_assert(default_empty_key<std::uint8_t >::key == 0xFFu);
+static_assert(default_empty_key<std::uint16_t>::key == 0xFFFFu);
+static_assert(default_empty_key<std::uint32_t>::key == 0xFFFFFFFFu);
+static_assert(default_empty_key<std::uint64_t>::key == 0xFFFFFFFFFFFFFFFFull);
 
 // Default hash: MurmurHash3 32-bit finalizer (fmix32) for 4-byte keys; an
 // 8-byte specialization is reserved for when 128-bit slot support is added.
@@ -125,10 +127,11 @@ struct default_hash<Key, 8> {
 template <
     class Key,
     class Value,
-    class Hash         = default_hash<Key>,
-    Key   EmptyKey     = default_empty_key<Key>::value,
-    int   CacheLineBytes = 128,
-    int   WarpSize     = 32
+    class Hash             = default_hash<Key>,
+    Key   EmptyKey         = default_empty_key<Key>::key,
+    int   CacheLineBytes   = 128,
+    int   WarpSize         = 32,
+    int   MaxProbeBuckets  = 8
 >
 class HashTable {
 public:
@@ -137,7 +140,12 @@ public:
     using hasher     = Hash;
 
     // Packed (key, value) slot. One Slot is the unit of an atomic CAS.
-    struct Slot {
+    // The alignas forces alignof(Slot) == sizeof(Slot), which is required
+    // by cuda::atomic_ref<Slot> (it needs the storage aligned to the
+    // atomic op width). For the supported Key/Value pairs (same-size
+    // integral types) sizeof(Key) + sizeof(Value) == sizeof(Slot) with no
+    // internal padding.
+    struct alignas(sizeof(Key) + sizeof(Value)) Slot {
         Key   key;
         Value value;
     };
@@ -155,13 +163,9 @@ public:
     // Slot / cache-line invariants.
     static_assert(slot_bytes == 8 || slot_bytes == 16,
                   "slot must be 8 or 16 bytes (a 64-bit or 128-bit packed "
-                  "key+value pair)");
-    // Temporary: v1 implements only 64-bit slots, which use a single
-    // atomicCAS<uint64_t>. Remove this assertion once 128-bit slots are
-    // supported (needed for 64-bit keys with 64-bit values, requiring
-    // 128-bit CAS on sm_70+).
-    static_assert(slot_bytes == 8,
-                  "only 64-bit slots are currently supported");
+                  "key+value pair). The 16-byte case uses 128-bit CAS via "
+                  "cuda::atomic_ref — single-instruction on sm_90+, "
+                  "emulated by libcu++ on earlier architectures.");
     static_assert(slot_bytes <= CacheLineBytes,
                   "slot does not fit in a cache line");
     static_assert(CacheLineBytes % slot_bytes == 0,
@@ -178,6 +182,37 @@ public:
                   "tile size must not exceed warp size");
     static_assert(WarpSize % bucket_size == 0,
                   "warp size must be a whole multiple of bucket size");
+
+    // A bucket is a contiguous run of `bucket_size` slots aligned to one
+    // cache line. The alignas guarantees that loading a bucket via a
+    // cooperative tile produces a single coalesced cache-line transaction
+    // (the bucket can never straddle two cache lines).
+    struct alignas(CacheLineBytes) Bucket {
+        Slot slots[bucket_size];
+    };
+
+    static_assert(sizeof(Bucket) == CacheLineBytes,
+                  "bucket must occupy exactly one cache line");
+    static_assert(alignof(Bucket) == CacheLineBytes,
+                  "bucket alignment must equal cache line size");
+
+    // Probe-length cap. An insert that would place a key further than this
+    // many buckets from its home bucket fails (the caller is expected to
+    // rehash into a larger table). Get takes advantage of the same cap: if
+    // it probes this many buckets without finding the key, the key cannot
+    // be in the table, because insert would have failed before placing it
+    // beyond the cap.
+    //
+    // The default of 8 comfortably handles load factors up to ~0.9 with
+    // bucket_size 16, where the expected longest probe is well under the
+    // cap. The cap exists to bound the worst case for adversarial inputs
+    // and very high load factors. Users targeting load factors above ~0.9
+    // can override via the `MaxProbeBuckets` template parameter; lowering
+    // it tightens the time bound at the cost of higher insert-failure
+    // probability.
+    static constexpr int max_probe_buckets = MaxProbeBuckets;
+    static_assert(max_probe_buckets > 0,
+                  "max_probe_buckets must be positive");
 
     // Byte value used to initialize the slot array via cudaMemset. Derived
     // from `empty_key`: every byte of `empty_key` must equal this byte for
@@ -220,8 +255,8 @@ public:
     private:
         friend class HashTable;
 
-        Slot*       slots_         = nullptr;
-        std::size_t capacity_      = 0;   // power of two
+        Bucket*     buckets_       = nullptr;
+        std::size_t capacity_      = 0;   // power of two, in slots
         std::size_t capacity_mask_ = 0;   // capacity_ - 1, for modulo via AND
         Hash        hash_{};
     };
@@ -249,8 +284,8 @@ public:
     std::size_t capacity() const noexcept { return capacity_; }
 
 private:
-    Slot*       slots_    = nullptr;
-    std::size_t capacity_ = 0;
+    Bucket*     buckets_  = nullptr;
+    std::size_t capacity_ = 0;  // in slots
 };
 
 // -----------------------------------------------------------------------------
@@ -262,59 +297,61 @@ private:
 // methods (constructor, destructor, move ops, view) are implemented; the
 // device-side View::insert and View::get bodies are still TODO.
 
-template <class K, class V, class H, K E, int CL, int WS>
-HashTable<K, V, H, E, CL, WS>::HashTable(std::size_t min_capacity) {
+template <class K, class V, class H, K E, int CL, int WS, int MPB>
+HashTable<K, V, H, E, CL, WS, MPB>::HashTable(std::size_t min_capacity) {
     // Round up to the next power of two, but never below a single bucket —
     // the bucketed probing logic requires at least bucket_size slots.
     const std::size_t rounded = detail::next_pow2(min_capacity);
     capacity_ = rounded < bucket_size ? std::size_t{bucket_size} : rounded;
 
-    // Allocate the slot array on the current device. cudaMalloc leaves
-    // slots_ as nullptr on failure; callers can check via
+    const std::size_t num_buckets = capacity_ / bucket_size;
+
+    // Allocate the bucket array on the current device. cudaMalloc leaves
+    // buckets_ as nullptr on failure; callers can check via
     // cudaPeekAtLastError().
-    cudaMalloc(&slots_, capacity_ * sizeof(Slot));
+    cudaMalloc(&buckets_, num_buckets * sizeof(Bucket));
 
     // Initialize every byte to empty_key_byte. For the supported default
     // (unsigned EmptyKey = 0xFF..FF) this writes the empty sentinel into
     // each slot's key field in a single bandwidth-bound DMA.
-    cudaMemset(slots_, empty_key_byte, capacity_ * sizeof(Slot));
+    cudaMemset(buckets_, empty_key_byte, num_buckets * sizeof(Bucket));
 }
 
-template <class K, class V, class H, K E, int CL, int WS>
-HashTable<K, V, H, E, CL, WS>::~HashTable() {
+template <class K, class V, class H, K E, int CL, int WS, int MPB>
+HashTable<K, V, H, E, CL, WS, MPB>::~HashTable() {
     // cudaFree(nullptr) is a documented no-op, so no need to guard.
-    cudaFree(slots_);
+    cudaFree(buckets_);
 }
 
-template <class K, class V, class H, K E, int CL, int WS>
-HashTable<K, V, H, E, CL, WS>::HashTable(HashTable&& other) noexcept
-    : slots_(other.slots_), capacity_(other.capacity_)
+template <class K, class V, class H, K E, int CL, int WS, int MPB>
+HashTable<K, V, H, E, CL, WS, MPB>::HashTable(HashTable&& other) noexcept
+    : buckets_(other.buckets_), capacity_(other.capacity_)
 {
-    other.slots_    = nullptr;
+    other.buckets_  = nullptr;
     other.capacity_ = 0;
 }
 
-template <class K, class V, class H, K E, int CL, int WS>
-HashTable<K, V, H, E, CL, WS>&
-HashTable<K, V, H, E, CL, WS>::operator=(HashTable&& other) noexcept {
+template <class K, class V, class H, K E, int CL, int WS, int MPB>
+HashTable<K, V, H, E, CL, WS, MPB>&
+HashTable<K, V, H, E, CL, WS, MPB>::operator=(HashTable&& other) noexcept {
     if (this != &other) {
         // Free the current allocation before taking ownership of the new one.
         // cudaFree(nullptr) is a no-op, so this is safe even if *this is in
         // a moved-from / empty state.
-        cudaFree(slots_);
-        slots_          = other.slots_;
+        cudaFree(buckets_);
+        buckets_        = other.buckets_;
         capacity_       = other.capacity_;
-        other.slots_    = nullptr;
+        other.buckets_  = nullptr;
         other.capacity_ = 0;
     }
     return *this;
 }
 
-template <class K, class V, class H, K E, int CL, int WS>
-typename HashTable<K, V, H, E, CL, WS>::View
-HashTable<K, V, H, E, CL, WS>::view() const noexcept {
+template <class K, class V, class H, K E, int CL, int WS, int MPB>
+typename HashTable<K, V, H, E, CL, WS, MPB>::View
+HashTable<K, V, H, E, CL, WS, MPB>::view() const noexcept {
     View v;
-    v.slots_         = slots_;
+    v.buckets_       = buckets_;
     v.capacity_      = capacity_;
     // For a usable table capacity_ is a power of two and the mask is
     // capacity_ - 1. For a moved-from / empty table capacity_ is 0; we set
@@ -325,27 +362,159 @@ HashTable<K, V, H, E, CL, WS>::view() const noexcept {
     return v;
 }
 
-template <class K, class V, class H, K E, int CL, int WS>
+template <class K, class V, class H, K E, int CL, int WS, int MPB>
 template <class Tile>
-__device__ bool HashTable<K, V, H, E, CL, WS>::View::insert(
-    const Tile& /*tile*/, K /*key*/, V /*value*/)
+__device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::insert(
+    const Tile& tile, K key, V value)
 {
-    // TODO: bucketed Robin Hood insertion. Each lane of `tile` reads one slot
-    //       of the current bucket; tile.ballot() identifies empty/match/
-    //       displaceable slots; the chosen lane performs the CAS; on
-    //       displacement, the evicted (key, value) becomes the new in-flight
-    //       pair and the tile advances by one bucket.
+    // Bucketed Robin Hood insertion with lock-free CAS. The tile carries an
+    // in-flight pair (cur_key, cur_value) that may change due to Robin Hood
+    // displacement — when we evict a "richer" resident, that resident
+    // becomes our new in-flight pair and we keep probing from the next
+    // bucket.
+
+    K cur_key   = key;
+    V cur_value = value;
+
+    const std::size_t num_buckets = capacity_ / bucket_size;
+    const std::size_t bucket_mask = num_buckets > 0 ? num_buckets - 1 : 0;
+    const std::size_t probe_bound = num_buckets < max_probe_buckets
+        ? num_buckets
+        : static_cast<std::size_t>(max_probe_buckets);
+
+    std::size_t cur_home = (hash_(cur_key) & capacity_mask_) / bucket_size;
+    std::size_t probe    = 0;
+
+    while (probe < probe_bound) {
+        const std::size_t bucket_idx = (cur_home + probe) & bucket_mask;
+
+        // Cooperative load: one coalesced cache-line transaction. Each
+        // lane reads one slot of the bucket (lane i reads slots[i]).
+        const Slot slot = buckets_[bucket_idx].slots[tile.thread_rank()];
+
+        // Helper: `target_lane` performs an atomic CAS to replace its slot
+        // (whose current contents we have in `slot`) with the in-flight
+        // pair. Returns the broadcast result of the CAS to every lane.
+        auto try_cas = [&](int target_lane) -> bool {
+            bool cas_ok = false;
+            if (tile.thread_rank() == target_lane) {
+                Slot expected = slot;
+                const Slot desired{cur_key, cur_value};
+                cuda::atomic_ref<Slot, cuda::thread_scope_device> atomic_slot(
+                    buckets_[bucket_idx].slots[target_lane]);
+                cas_ok = atomic_slot.compare_exchange_strong(expected, desired);
+            }
+            return tile.shfl(cas_ok, target_lane);
+        };
+
+        // (1) Key match — update the existing entry's value.
+        const auto match_mask = tile.ballot(slot.key == cur_key);
+        if (match_mask != 0) {
+            if (try_cas(__ffs(match_mask) - 1)) return true;
+            continue;  // CAS lost the race — retry this bucket.
+        }
+
+        // (2) Empty slot — claim it for our in-flight pair.
+        const auto empty_mask = tile.ballot(slot.key == empty_key);
+        if (empty_mask != 0) {
+            if (try_cas(__ffs(empty_mask) - 1)) return true;
+            continue;  // Someone else took the slot — retry.
+        }
+
+        // (3) Displaceable slot — Robin Hood swap with a richer resident.
+        // Compute each resident's probe distance. (For empty slots this
+        // gives nonsense, but we already eliminated the empty case above,
+        // so the next ballot is meaningful.)
+        const std::size_t resident_home =
+            (hash_(slot.key) & capacity_mask_) / bucket_size;
+        const std::size_t resident_probe =
+            (bucket_idx - resident_home) & bucket_mask;
+        const auto displaceable_mask = tile.ballot(resident_probe < probe);
+        if (displaceable_mask != 0) {
+            const int target_lane = __ffs(displaceable_mask) - 1;
+            if (try_cas(target_lane)) {
+                // Adopt the evicted pair as our new in-flight pair. We
+                // continue from the next bucket; the evicted pair's probe
+                // distance there is `resident_probe + 1`.
+                cur_key   = tile.shfl(slot.key,        target_lane);
+                cur_value = tile.shfl(slot.value,      target_lane);
+                cur_home  = tile.shfl(resident_home,   target_lane);
+                probe     = tile.shfl(resident_probe,  target_lane) + 1;
+                continue;
+            }
+            continue;  // CAS lost the race — retry.
+        }
+
+        // (4) Nothing applies — advance one bucket.
+        ++probe;
+    }
+
+    // Probe budget exhausted. Caller is expected to rehash into a larger
+    // table or accept the failure.
     return false;
 }
 
-template <class K, class V, class H, K E, int CL, int WS>
+template <class K, class V, class H, K E, int CL, int WS, int MPB>
 template <class Tile>
-__device__ bool HashTable<K, V, H, E, CL, WS>::View::get(
-    const Tile& /*tile*/, K /*key*/, V& /*out_value*/) const
+__device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::get(
+    const Tile& tile, K key, V& out_value) const
 {
-    // TODO: bucketed lookup. Same probing rule as insert but read-only; stop
-    //       on key-match (return true), on empty slot (return false), or on a
-    //       resident whose probe distance is smaller than ours (return false).
+    // Bucket-level Robin Hood lookup. Probe home_bucket, then home_bucket+1,
+    // etc., wrapping modulo num_buckets. Each iteration is one coalesced
+    // cache-line load (one slot per tile lane) and a few tile-wide ballots
+    // to identify the terminating condition.
+
+    const auto h = hash_(key);
+    const std::size_t home_slot   = h & capacity_mask_;
+    const std::size_t home_bucket = home_slot / bucket_size;
+    const std::size_t num_buckets = capacity_ / bucket_size;
+    const std::size_t bucket_mask = num_buckets > 0 ? num_buckets - 1 : 0;
+
+    // Probe at most max_probe_buckets buckets, or every bucket in the table
+    // if it's smaller than the cap.
+    const std::size_t probe_bound = num_buckets < max_probe_buckets
+        ? num_buckets
+        : static_cast<std::size_t>(max_probe_buckets);
+
+    for (std::size_t probe = 0; probe < probe_bound; ++probe) {
+        const std::size_t bucket_idx = (home_bucket + probe) & bucket_mask;
+
+        // Each lane reads one slot — one coalesced cache-line transaction
+        // for the whole tile.
+        const Slot slot = buckets_[bucket_idx].slots[tile.thread_rank()];
+
+        // (1) Key match. The matching lane broadcasts its value to the rest
+        //     of the tile via shfl.
+        const auto match_mask = tile.ballot(slot.key == key);
+        if (match_mask != 0) {
+            const int matching_lane = __ffs(match_mask) - 1;
+            out_value = tile.shfl(slot.value, matching_lane);
+            return true;
+        }
+
+        // (2) Empty slot. The key isn't in the table — Robin Hood would have
+        //     placed it earlier in the probe sequence.
+        if (tile.ballot(slot.key == empty_key) != 0) return false;
+
+        // (3) Robin Hood early termination. If any resident is "richer"
+        //     (closer to its home bucket than we are to ours), our key would
+        //     have evicted it on insertion, so it can't be later in the
+        //     probe sequence.
+        const std::size_t resident_home =
+            (hash_(slot.key) & capacity_mask_) / bucket_size;
+        const std::size_t resident_probe =
+            (bucket_idx - resident_home) & bucket_mask;
+        if (tile.ballot(resident_probe < probe) != 0) return false;
+
+        // No match, no empty slot, no richer resident — every slot here is
+        // occupied by a resident at least as displaced as we would be.
+        // Advance one bucket.
+    }
+
+    // Either hit the probe cap, or wrapped fully around in a small table,
+    // without finding the key, an empty slot, or a richer resident. The
+    // insert invariant guarantees the key cannot be at probe distance
+    // greater than max_probe_buckets, so this is a definite "not present".
     return false;
 }
 
