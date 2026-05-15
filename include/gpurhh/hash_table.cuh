@@ -8,12 +8,13 @@
 // See the notes/ directory for the design rationale behind this layout.
 //
 // The hash table itself lives in device memory. Host code constructs and
-// destructs a HashTable, which allocates and zero-initialises the slot array
+// destructs a HashTable, which allocates and zero-initializes the slot array
 // on the device. All operations on the contents — insert, get — are device
 // code, exposed through the View handle which is meant to be passed by value
 // into user kernels. Data movement between host and device (e.g. building the
 // input arrays, reading back results) is the caller's responsibility.
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -27,11 +28,11 @@ namespace gpurhh {
 // Defaults: empty-key sentinel and hash function.
 // -----------------------------------------------------------------------------
 
-// Reserved value signalling an empty slot. Users may not insert this key.
+// Reserved value signaling an empty slot. Users may not insert this key.
 //
 // Default is the all-bits-set representation of `Key` — every byte is 0xFF,
 // so `value` is the maximum representable value (e.g. 0xFFFFFFFFu for
-// uint32_t). The all-ones bit pattern lets `HashTable` initialise its
+// uint32_t). The all-ones bit pattern lets `HashTable` initialize its
 // slot array with a single cudaMemset(0xFF, ...) at construction.
 //
 // Compiles for: unsigned integral types only. For signed integers,
@@ -88,6 +89,12 @@ __host__ __device__ inline std::uint64_t fmix64(std::uint64_t k) noexcept {
     k *= 0xc4ceb9fe1a85ec53ULL;
     k ^= k >> 33;
     return k;
+}
+
+// Round `n` up to the next power of two. Returns 1 for n == 0 or n == 1.
+constexpr inline std::size_t next_pow2(std::size_t n) noexcept {
+    if (n <= 1) return 1;
+    return std::size_t{1} << std::bit_width(n - 1);
 }
 
 } // namespace detail
@@ -172,6 +179,24 @@ public:
     static_assert(WarpSize % bucket_size == 0,
                   "warp size must be a whole multiple of bucket size");
 
+    // Byte value used to initialize the slot array via cudaMemset. Derived
+    // from `empty_key`: every byte of `empty_key` must equal this byte for
+    // the cudaMemset-based init path to produce a correctly-empty slot array.
+    static constexpr unsigned char empty_key_byte =
+        std::bit_cast<std::array<unsigned char, sizeof(Key)>>(empty_key)[0];
+
+    // EmptyKey memsettability invariant.
+    static_assert([]() {
+        const auto bytes = std::bit_cast<std::array<unsigned char, sizeof(Key)>>(empty_key);
+        for (std::size_t i = 1; i < sizeof(Key); ++i) {
+            if (bytes[i] != bytes[0]) return false;
+        }
+        return true;
+    }(),
+    "EmptyKey must be a single byte pattern repeated across sizeof(Key) "
+    "bytes so the slot array can be initialized via cudaMemset. Use the "
+    "default for unsigned keys, or provide an EmptyKey of the form 0xBB..BB.");
+
     // -------------------------------------------------------------------------
     // View: lightweight device-side handle. Trivially copyable; pass by value
     // into user kernels. Holds only a device pointer and a couple of integers.
@@ -207,7 +232,7 @@ public:
 
     // Allocates a slot array on the current device sized for at least
     // `min_capacity` slots, rounded up to the next power of two, and
-    // initialises every slot to (empty_key, _).
+    // initializes every slot to (empty_key, _).
     explicit HashTable(std::size_t min_capacity);
 
     ~HashTable();
@@ -236,35 +261,66 @@ private:
 // template and instantiations need full definitions visible at the call site.
 
 template <class K, class V, class H, K E, int CL, int WS>
-HashTable<K, V, H, E, CL, WS>::HashTable(std::size_t /*min_capacity*/) {
-    // TODO: round min_capacity up to next power of two; cudaMalloc slots_;
-    //       launch an init kernel (or cudaMemset to a chosen byte pattern) to
-    //       set every slot's key field to empty_key.
+HashTable<K, V, H, E, CL, WS>::HashTable(std::size_t min_capacity) {
+    // Round up to the next power of two, but never below a single bucket —
+    // the bucketed probing logic requires at least bucket_size slots.
+    const std::size_t rounded = detail::next_pow2(min_capacity);
+    capacity_ = rounded < bucket_size ? std::size_t{bucket_size} : rounded;
+
+    // Allocate the slot array on the current device. cudaMalloc leaves
+    // slots_ as nullptr on failure; callers can check via
+    // cudaPeekAtLastError().
+    cudaMalloc(&slots_, capacity_ * sizeof(Slot));
+
+    // Initialize every byte to empty_key_byte. For the supported default
+    // (unsigned EmptyKey = 0xFF..FF) this writes the empty sentinel into
+    // each slot's key field in a single bandwidth-bound DMA.
+    cudaMemset(slots_, empty_key_byte, capacity_ * sizeof(Slot));
 }
 
 template <class K, class V, class H, K E, int CL, int WS>
 HashTable<K, V, H, E, CL, WS>::~HashTable() {
-    // TODO: cudaFree(slots_) if non-null.
+    // cudaFree(nullptr) is a documented no-op, so no need to guard.
+    cudaFree(slots_);
 }
 
 template <class K, class V, class H, K E, int CL, int WS>
-HashTable<K, V, H, E, CL, WS>::HashTable(HashTable&&) noexcept {
-    // TODO: steal slots_ and capacity_ from the moved-from instance.
+HashTable<K, V, H, E, CL, WS>::HashTable(HashTable&& other) noexcept
+    : slots_(other.slots_), capacity_(other.capacity_)
+{
+    other.slots_    = nullptr;
+    other.capacity_ = 0;
 }
 
 template <class K, class V, class H, K E, int CL, int WS>
 HashTable<K, V, H, E, CL, WS>&
-HashTable<K, V, H, E, CL, WS>::operator=(HashTable&&) noexcept {
-    // TODO: free current state if any, then steal from RHS.
+HashTable<K, V, H, E, CL, WS>::operator=(HashTable&& other) noexcept {
+    if (this != &other) {
+        // Free the current allocation before taking ownership of the new one.
+        // cudaFree(nullptr) is a no-op, so this is safe even if *this is in
+        // a moved-from / empty state.
+        cudaFree(slots_);
+        slots_          = other.slots_;
+        capacity_       = other.capacity_;
+        other.slots_    = nullptr;
+        other.capacity_ = 0;
+    }
     return *this;
 }
 
 template <class K, class V, class H, K E, int CL, int WS>
 typename HashTable<K, V, H, E, CL, WS>::View
 HashTable<K, V, H, E, CL, WS>::view() const noexcept {
-    // TODO: populate a View with slots_, capacity_, capacity_ - 1, and a
-    //       default-constructed Hash.
-    return {};
+    View v;
+    v.slots_         = slots_;
+    v.capacity_      = capacity_;
+    // For a usable table capacity_ is a power of two and the mask is
+    // capacity_ - 1. For a moved-from / empty table capacity_ is 0; we set
+    // the mask to 0 explicitly to avoid a wrap-around to ~0 which would be
+    // misleading even though the View is unusable in that state anyway.
+    v.capacity_mask_ = capacity_ > 0 ? capacity_ - 1 : 0;
+    // v.hash_ is default-constructed by View's in-class default initializer.
+    return v;
 }
 
 template <class K, class V, class H, K E, int CL, int WS>

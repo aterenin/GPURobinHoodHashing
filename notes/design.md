@@ -7,7 +7,7 @@
   No separate compilation of the table itself.
 - **Massively parallel insertion.**
   A batch of `N` keys is inserted by `N` (or more) GPU threads cooperatively.
-  Worst-case behaviour must remain bounded even under heavy contention.
+  Worst-case behavior must remain bounded even under heavy contention.
 - **Memory-bandwidth bound.**
   On large tables, the table is much bigger than the L2 cache, so performance is determined by how many useful bytes each DRAM transaction delivers.
   The aim is to come as close to peak HBM bandwidth as the access pattern allows.
@@ -52,7 +52,7 @@ For 64-bit keys or larger payloads we have two options:
 2. **Separate parallel arrays** (`keys[]` and `values[]`) with the key array being the source of truth for CAS, and values being written only by the thread that successfully claimed the slot.
    This halves the bytes-per-CAS but requires care: a finder must re-read the key after reading the value to make sure the slot wasn't reused mid-read.
 
-We will start with the 64-bit packed slot and parameterise later.
+We will start with the 64-bit packed slot and parameterize later.
 
 **Probe distance.**
 We do *not* store probe distance in the slot.
@@ -85,7 +85,7 @@ This is the standard lock-free retry.
 ### Why this is correct under contention
 
 The Robin Hood invariant is maintained by every individual CAS because each CAS only swaps in a pair with probe distance strictly greater than the one already in the slot (or the slot was empty).
-Two concurrent inserts targeting the same slot serialise through CAS, and whichever loses retries with the freshest state.
+Two concurrent inserts targeting the same slot serialize through CAS, and whichever loses retries with the freshest state.
 There is no global ordering requirement: as long as every write respects the local invariant, the final table is a valid Robin Hood layout for *some* permutation of the input.
 
 Caveat: the *value* portion of an update (case 2) needs care.
@@ -192,7 +192,7 @@ Anything that ends up baked in as a literal in the implementation is a portabili
 - **Lookup.**
   Same probing rule, no CAS.
   Stop as soon as we find the key, an empty slot, or a resident whose probe distance is smaller than ours.
-  Lookup is fully read-only and trivially parallel — no synchronisation required.
+  Lookup is fully read-only and trivially parallel — no synchronization required.
 - **Deletion.**
   Backward-shift: starting from the deleted slot, while the next slot is non-empty and its probe distance is positive, shift it back by one.
   On a concurrent GPU this is the hardest operation to make correct without locks.
@@ -234,7 +234,7 @@ private:
 } // namespace gpurhh
 ```
 
-The `View` is the centrepiece for header-only use: a user kernel that already has its keys in registers can call `view.insert(...)` directly without a separate kernel launch.
+The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers can call `view.insert(...)` directly without a separate kernel launch.
 
 ## Open questions / things to settle before coding
 
@@ -255,7 +255,7 @@ The `View` is the centrepiece for header-only use: a user kernel that already ha
    Out of scope for v1 but informs the abstractions — see the AMD aside above.
    `CacheLineBytes` and `WarpSize` should be table-level parameters, not magic numbers in the implementation.
 6. **Testing.**
-   A small CPU reference implementation (sequential Robin Hood) plus a randomised differential test against the GPU implementation, plus stress tests at 0.5/0.7/0.9 load.
+   A small CPU reference implementation (sequential Robin Hood) plus a randomized differential test against the GPU implementation, plus stress tests at 0.5/0.7/0.9 load.
 
 ## Suggested next steps
 

@@ -17,7 +17,7 @@ The design target is bandwidth-bound performance on large tables.
   Each `test_*.cu` file is compiled as its own executable with its own `main`, scoped to one topic (a public method, a trait, etc.).
   Shared driver kernels, CUDA error-check operator, and host-side bulk helpers live in `tests/common.cuh`; small CUDA utilities like `CUDA_CHECK` live in `tests/utils.cuh`.
 - `examples/` — small standalone programs demonstrating use of the library.
-  Currently a placeholder; will be populated as the API stabilises.
+  Currently a placeholder; will be populated as the API stabilizes.
 - `notes/` — design notes, written for humans.
   These files are the canonical record of *why* the implementation looks the way it does.
   They are intended to eventually become the project's documentation, but they are not documentation yet — they are working notes that capture decisions as we make them.
