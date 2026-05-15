@@ -257,8 +257,10 @@ private:
 // Definitions.
 // -----------------------------------------------------------------------------
 //
-// All function bodies are TODO. They live in the header because the class is a
-// template and instantiations need full definitions visible at the call site.
+// Function bodies live in the header because the class is a template and
+// instantiations need full definitions visible at the call site. Host-side
+// methods (constructor, destructor, move ops, view) are implemented; the
+// device-side View::insert and View::get bodies are still TODO.
 
 template <class K, class V, class H, K E, int CL, int WS>
 HashTable<K, V, H, E, CL, WS>::HashTable(std::size_t min_capacity) {
