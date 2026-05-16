@@ -32,7 +32,7 @@ static_assert(kBlockSize % Table::tile_size == 0,
 // pair. Tiles are tile-strided across the grid so batches larger than the
 // grid still work.
 
-__global__ inline void insert_kernel(View view,
+__global__ void insert_kernel(View view,
                                      const std::uint32_t* keys,
                                      const std::uint32_t* values,
                                      std::size_t n)
@@ -53,7 +53,7 @@ __global__ inline void insert_kernel(View view,
 // For each input key, writes (value, 1) on hit and (_, 0) on miss. We assume
 // view.get broadcasts the located value to every lane in the tile, and have
 // lane 0 perform the store to keep the store count to one per key.
-__global__ inline void get_kernel(View view,
+__global__ void get_kernel(View view,
                                   const std::uint32_t* keys,
                                   std::uint32_t* values_out,
                                   int* found_out,

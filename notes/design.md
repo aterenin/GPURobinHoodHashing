@@ -15,10 +15,17 @@
 ## Language and toolchain
 
 - **Target language: C++20.**
-- **Target CUDA toolkit: CUDA 13.**
+- **Target CUDA toolkit: CUDA 13.x.**
+  Driven by two requirements: `-std=c++20` support in nvcc (CUDA 12.0+) and `cuda::std::bit_cast` in libcu++ (CUDA 13.0 was the first version where this combination worked cleanly on the test system).
 
 Within the implementation, we stick to C++17-shape idioms by default and only reach for C++20 features where they demonstrably improve the code.
-Today that is one use: `std::bit_cast` for the hash function's bit reinterpret, which replaces the `memcpy` idiom common in pre-C++20 GPU code.
+The C++20 uses today are:
+
+- `std::bit_width` in `next_pow2` (host-side, compile-time).
+- Host-side compile-time `std::bit_cast` for the `empty_key_byte` extraction and the memsettability `static_assert` lambda.
+- Device-side `cuda::std::bit_cast` (libcu++) for the runtime bit-reinterpret in `default_hash`.
+  The libcu++ version is mandatory here because `std::bit_cast` is host-only `constexpr` in libstdc++; calling it from a `__device__` function is a hard error in CUDA 13.x.
+
 Concepts on the `Hash` template parameter, `std::source_location` in place of `__FILE__` / `__LINE__` macros, ranges, and coroutines are all deferred until they pay for themselves.
 
 The C++20 baseline is conservative future-proofing: it lets us reach for the cleaner spelling when we want it without revisiting the build settings each time.
@@ -39,20 +46,19 @@ A slot is the unit of an atomic update.
 The simplest design that admits lock-free CAS on a single machine word is:
 
 ```
-struct Slot {                       // 8 bytes total — fits in atomicCAS<uint64_t>
-    uint32_t key;
-    uint32_t value;                 // or a 32-bit payload / pointer index
+struct alignas(sizeof(Key) + sizeof(Value)) Slot {
+    Key   key;       // typically uint32_t or uint64_t
+    Value value;     // typically the same width as Key
 };
 ```
 
-Empty slots use a reserved sentinel key (e.g. `0xFFFFFFFF`); users are forbidden from inserting that key.
-For 64-bit keys or larger payloads we have two options:
+Empty slots use a reserved sentinel key (default: all-bits-set for unsigned integer Key); users are forbidden from inserting that key.
+The packed slot supports two widths:
 
-1. **128-bit slots** with `__int128` CAS via `atomicCAS` on `unsigned long long` pairs — supported on sm_70+ but with reduced throughput.
-2. **Separate parallel arrays** (`keys[]` and `values[]`) with the key array being the source of truth for CAS, and values being written only by the thread that successfully claimed the slot.
-   This halves the bytes-per-CAS but requires care: a finder must re-read the key after reading the value to make sure the slot wasn't reused mid-read.
+1. **64-bit slots** (4-byte key + 4-byte value): atomic CAS via `cuda::atomic_ref<Slot>`, which on every NVIDIA arch compiles down to a 64-bit `atom.cas`. Fast.
+2. **128-bit slots** (8-byte key + 8-byte value): atomic CAS still goes through `cuda::atomic_ref<Slot>`; on sm_90+ this is the single-instruction `atom.cas.b128`, on sm_70–sm_89 libcu++ emulates with a lock-table fallback. Functional everywhere, but the emulated path is significantly slower than 64-bit CAS under contention.
 
-We will start with the 64-bit packed slot and parameterize later.
+We use the same control flow for both widths — the only thing that changes is which atomic instruction `cuda::atomic_ref::compare_exchange_strong` resolves to. A parallel-arrays layout (separate keys[] and values[]) is rejected: it halves the per-CAS bytes but at the cost of an awkward second-read-the-key step for finders that complicates correctness.
 
 **Probe distance.**
 We do *not* store probe distance in the slot.
@@ -105,9 +111,9 @@ The bandwidth strategy follows from this:
   Insertion still uses CAS on a single 8-byte slot inside the bucket, but the read traffic per probe is exactly one cache line.
   This is the same idea as `bucketed_cuckoo` and Bucketized Cuckoo Hashing.
 - **Probe length capping.**
-  Cap probes at, say, 32 buckets.
-  If a thread overruns the cap during insertion, mark the batch as failed and rehash.
-  With Robin Hood at 0.7 load this happens with vanishing probability for reasonable `N`.
+  Exposed as a `MaxProbeBuckets` template parameter (default 8).
+  An insert that would place a key past the cap fails (the caller is expected to rehash); a get that probes the cap without finding the key returns "not found" (correct because of the insert-side cap).
+  With Robin Hood at load factor ~0.85 and `bucket_size` 16, the expected longest probe is well under the default cap; the cap protects against adversarial inputs and very high load factors.
 - **Avoid divergence.**
   All threads in a warp execute the same probe loop.
   The "I'm done, others aren't" case is handled with masked operations rather than early-return-then-divergence.
@@ -161,18 +167,19 @@ Every step is a warp-intrinsic operation on a single cache line, which is what m
 
 Once we commit to the sub-warp tile design, almost every constant is *derived* from the hardware, not chosen:
 
-| Parameter         | Value (default)              | Source                                   |
-| ----------------- | ---------------------------- | ---------------------------------------- |
-| `SlotBytes`       | 8                            | Key/value packing choice                 |
-| `CacheLineBytes`  | 128 (NVIDIA)                 | Hardware                                 |
-| `BucketSize`      | `CacheLineBytes / SlotBytes` | **Derived**                              |
-| `WarpSize`        | 32 (NVIDIA)                  | Hardware                                 |
-| `TileSize`        | `BucketSize`                 | **Derived** (the central design choice)  |
-| `TilesPerWarp`    | `WarpSize / BucketSize`      | **Derived**                              |
-| `BlockSize`       | tuned (e.g. 128 or 256)      | Occupancy — empirical                    |
-| `TargetLoadFactor`| tuned (e.g. 0.7)             | Robin Hood quality — empirical           |
+| Parameter          | Value (default)              | Source                                   |
+| ------------------ | ---------------------------- | ---------------------------------------- |
+| `SlotBytes`        | 8 (4+4) or 16 (8+8)          | Key/value packing choice                 |
+| `CacheLineBytes`   | 128 (NVIDIA)                 | Hardware                                 |
+| `BucketSize`       | `CacheLineBytes / SlotBytes` | **Derived**                              |
+| `WarpSize`         | 32 (NVIDIA)                  | Hardware                                 |
+| `TileSize`         | `BucketSize`                 | **Derived** (the central design choice)  |
+| `TilesPerWarp`     | `WarpSize / BucketSize`      | **Derived**                              |
+| `BlockSize`        | tuned (e.g. 128 or 256)      | Occupancy — empirical                    |
+| `TargetLoadFactor` | tuned (e.g. 0.7)             | Robin Hood quality — empirical           |
+| `MaxProbeBuckets`  | 8                            | Worst-case time vs. insert-failure rate  |
 
-So the only genuinely free knobs are `BlockSize` and `TargetLoadFactor`.
+So the only genuinely free knobs are `BlockSize`, `TargetLoadFactor`, and `MaxProbeBuckets`.
 The rest should be expressed in the code as compile-time constants derived from `SlotBytes`, `CacheLineBytes`, and `WarpSize`, with the latter two being template parameters of the table (with sensible defaults) rather than hard-coded.
 
 ### Why the abstraction matters — an AMD aside (out of scope for v1)
@@ -205,46 +212,51 @@ namespace gpurhh {
 
 template <class Key,
           class Value,
-          class Hash = default_hash<Key>,
-          Key   EmptyKey = Key{} - Key{1}>            // sentinel
+          class Hash             = default_hash<Key>,
+          Key   EmptyKey         = default_empty_key<Key>::key,
+          int   CacheLineBytes   = 128,
+          int   WarpSize         = 32,
+          int   MaxProbeBuckets  = 8>
 class HashTable {
 public:
-    // Host-side construction allocates device memory.
-    explicit HashTable(std::size_t capacity);
+    // Host-side: allocate and initialize the device-resident slot array.
+    explicit HashTable(std::size_t min_capacity);
+    ~HashTable();
 
-    // Bulk operations. Stream-aware, non-owning input buffers.
-    void insert(const Key* keys, const Value* values,
-                std::size_t n, cudaStream_t stream = 0);
+    // Non-copyable, movable.
+    HashTable(HashTable&&) noexcept;
+    HashTable& operator=(HashTable&&) noexcept;
 
-    void get(const Key* keys, Value* values_out,
-             std::size_t n, cudaStream_t stream = 0) const;
+    // Device-side, copyable handle. Trivially passed by value into kernels.
+    class View {
+    public:
+        template <class Tile>
+        __device__ bool insert(const Tile& tile, Key key, Value value);
 
-    // A device-side, copyable handle for use inside user kernels.
-    struct View {
-        __device__ bool  insert(Key k, Value v);
-        __device__ bool  get   (Key k, Value& out) const;
+        template <class Tile>
+        __device__ bool get(const Tile& tile, Key key, Value& out) const;
     };
-    View view();
 
-private:
-    Slot*       slots_;
-    std::size_t capacity_;
+    View view() const noexcept;
+    std::size_t capacity() const noexcept;  // power of two, in slots
 };
 
 } // namespace gpurhh
 ```
 
-The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers can call `view.insert(...)` directly without a separate kernel launch.
+The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers can call `view.insert(tile, ...)` directly.
+Bulk host-side operations are deliberately *not* part of the table — callers manage their device buffers and write their own driver kernels, which calls `view.insert` / `view.get` cooperatively from a tile of `tile_size` threads.
+The tests in `tests/common.cuh` show the canonical pattern.
 
-## Open questions / things to settle before coding
+## Open questions / things to settle
 
 1. **Slot width.**
-   Start with 64-bit packed `(uint32 key, uint32 value)`, or go straight to a 128-bit slot for 64-bit keys?
-   The 64-bit case is the canonical micro-benchmark and is what most published GPU hash tables use.
-   Note that changing this also changes the derived `BucketSize`.
+   Both 64-bit (4+4 byte) and 128-bit (8+8 byte) packings are supported via `cuda::atomic_ref<Slot>`.
+   The 64-bit case is what current tests exercise; the 128-bit case compiles and links but uses libcu++'s lock-emulated 128-bit CAS on pre-Hopper GPUs, which is significantly slower than 64-bit CAS.
+   Open: validate the 128-bit path on a Hopper system, and benchmark.
 2. **Failure semantics on full table.**
-   Return a count of failed inserts, or `assert`?
-   A bulk-insert API can naturally return the number of survivors and let the caller resize.
+   `View::insert` currently returns `false` when the probe-length cap is hit.
+   Open: whether a bulk operation should return a survivor count or just a failure flag — depends on whether we add bulk operations to the API at all.
 3. **Resize.**
    Out of scope for v1.
    The table is allocated at a fixed capacity.
@@ -253,13 +265,15 @@ The `View` is the centerpiece for header-only use: a user kernel that already ha
    Out of scope for v1.
 5. **Portability across vendors.**
    Out of scope for v1 but informs the abstractions — see the AMD aside above.
-   `CacheLineBytes` and `WarpSize` should be table-level parameters, not magic numbers in the implementation.
+   `CacheLineBytes` and `WarpSize` are table-level parameters, not magic numbers in the implementation.
 6. **Testing.**
-   A small CPU reference implementation (sequential Robin Hood) plus a randomized differential test against the GPU implementation, plus stress tests at 0.5/0.7/0.9 load.
+   Basic correctness tests exist (construction, single-tile insert, single-tile get).
+   Still missing: a CPU reference for randomized differential testing; concurrency stress tests at varying load factors; probe-cap stress tests; benchmarks against `cuCollections` / `WarpCore`.
 
 ## Suggested next steps
 
-1. Sketch the `Slot`, hash, and probe primitives in a single `.cuh`.
-2. Implement the insert kernel without bucketing, just to validate correctness and the CAS loop.
-3. Add the bucketed (cache-line-aligned) variant and benchmark against the naive one.
-4. Add `get`, then benchmark against `cuCollections` / `WarpCore` as external baselines.
+1. Smoke-test the end-to-end pipeline on a real GPU (build, run `test_construction`, `test_insert`, `test_get`).
+2. Wire up `examples/basic.cu` as a self-contained demonstration of construct + bulk insert + bulk lookup.
+3. Add randomized differential tests against a CPU reference Robin Hood implementation.
+4. Add stress tests for concurrency and load-factor edges.
+5. Benchmark against `cuCollections` / `WarpCore` to validate the bandwidth-bound claim.

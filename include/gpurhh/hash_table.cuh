@@ -22,6 +22,7 @@
 
 #include <cooperative_groups.h>
 #include <cuda/atomic>
+#include <cuda/std/bit>
 #include <cuda_runtime.h>
 
 namespace gpurhh {
@@ -75,7 +76,7 @@ static_assert(default_empty_key<std::uint64_t>::key == 0xFFFFFFFFFFFFFFFFull);
 
 namespace detail {
 
-__host__ __device__ inline std::uint32_t fmix32(std::uint32_t h) noexcept {
+__device__ inline std::uint32_t fmix32(std::uint32_t h) noexcept {
     h ^= h >> 16;
     h *= 0x85ebca6bu;
     h ^= h >> 13;
@@ -84,7 +85,7 @@ __host__ __device__ inline std::uint32_t fmix32(std::uint32_t h) noexcept {
     return h;
 }
 
-__host__ __device__ inline std::uint64_t fmix64(std::uint64_t k) noexcept {
+__device__ inline std::uint64_t fmix64(std::uint64_t k) noexcept {
     k ^= k >> 33;
     k *= 0xff51afd7ed558ccdULL;
     k ^= k >> 33;
@@ -108,15 +109,15 @@ struct default_hash;
 
 template <class Key>
 struct default_hash<Key, 4> {
-    __host__ __device__ inline std::uint32_t operator()(Key key) const noexcept {
-        return detail::fmix32(std::bit_cast<std::uint32_t>(key));
+    __device__ inline std::uint32_t operator()(Key key) const noexcept {
+        return detail::fmix32(cuda::std::bit_cast<std::uint32_t>(key));
     }
 };
 
 template <class Key>
 struct default_hash<Key, 8> {
-    __host__ __device__ inline std::uint64_t operator()(Key key) const noexcept {
-        return detail::fmix64(std::bit_cast<std::uint64_t>(key));
+    __device__ inline std::uint64_t operator()(Key key) const noexcept {
+        return detail::fmix64(cuda::std::bit_cast<std::uint64_t>(key));
     }
 };
 

@@ -17,13 +17,14 @@ The design target is bandwidth-bound performance on large tables.
   Each `test_*.cu` file is compiled as its own executable with its own `main`, scoped to one topic (a public method, a trait, etc.).
   Shared driver kernels, CUDA error-check operator, and host-side bulk helpers live in `tests/common.cuh`; small CUDA utilities like `CUDA_CHECK` live in `tests/utils.cuh`.
 - `examples/` — small standalone programs demonstrating use of the library.
-  Currently a placeholder; will be filled in once `View::insert` and `View::get` are implemented.
+  Currently a placeholder; to be filled in with a real construct + bulk insert + bulk lookup demo.
 - `notes/` — design notes, written for humans.
   These files are the canonical record of *why* the implementation looks the way it does.
   They are intended to eventually become the project's documentation, but they are not documentation yet — they are working notes that capture decisions as we make them.
   Read these before touching code.
-- `Makefile` — builds tests and examples with `nvcc`.
-  `make test` builds and runs all tests; `make clean` wipes `build/`. Defaults to C++20 and `sm_80`; override via env vars (`make ARCH=sm_75 CXX_STD=c++17`).
+- `Makefile` — builds tests and examples with `nvcc`. Defaults to C++20, `sm_89`, and no optimization.
+  Build modes: `make` (no `-O`), `make release` (`-O2`), `make debug` (`-O0 -G -g`).
+  Other useful targets: `make test` builds and runs all tests, `make clean` wipes `build/`. Override flags via env vars (`make ARCH=sm_90 CXX_STD=c++17`).
 
 When new design decisions are made or revised, update the relevant note in `notes/` rather than scattering rationale across commit messages or code comments.
 
