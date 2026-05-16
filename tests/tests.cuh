@@ -9,6 +9,11 @@
 // The macro captures the call site so errors are reported with file:line and
 // individual call sites do not need to carry a context string.
 
+// Opt into the gpurhh testing back-door. This must be defined before any
+// inclusion of <gpurhh/hash_table.cuh> in this translation unit, so that
+// HashTable::data() is exposed for direct memory inspection / seeding.
+#define GPURHH_ENABLE_INTERNAL_ACCESS 1
+
 #include <cstdio>
 #include <cstdlib>
 

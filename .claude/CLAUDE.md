@@ -15,7 +15,7 @@ The design target is bandwidth-bound performance on large tables.
   The library is header-only; everything ships from here.
 - `tests/` — tests built against the public header.
   Each `test_*.cu` file is compiled as its own executable with its own `main`, scoped to one topic (a public method, a trait, etc.).
-  Shared driver kernels, CUDA error-check operator, and host-side bulk helpers live in `tests/common.cuh`; small CUDA utilities like `CUDA_CHECK` live in `tests/utils.cuh`.
+  Shared driver kernels, table aliases, and host-side bulk helpers live in `tests/kernels.cuh`; the CUDA error-check operator and other test-wide infrastructure (including the macro that exposes `HashTable::data()`) live in `tests/tests.cuh`.
 - `examples/` — small standalone programs demonstrating use of the library.
   Currently a placeholder; to be filled in with a real construct + bulk insert + bulk lookup demo.
 - `notes/` — design notes, written for humans.

@@ -1,6 +1,6 @@
 // Construction / allocation tests for gpurhh::HashTable.
 
-#include "common.cuh"
+#include "kernels.cuh"
 
 namespace {
 

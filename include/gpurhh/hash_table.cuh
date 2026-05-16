@@ -23,6 +23,7 @@
 #include <cooperative_groups.h>
 #include <cuda/atomic>
 #include <cuda/std/bit>
+#include <cuda/std/optional>
 #include <cuda_runtime.h>
 
 namespace gpurhh {
@@ -245,11 +246,11 @@ public:
         template <class Tile>
         __device__ bool insert(const Tile& tile, Key key, Value value);
 
-        // Cooperative single-key lookup.
-        // Returns true and writes the stored value to `out_value` if the key
-        // is present; returns false otherwise.
+        // Cooperative single-key lookup. Returns the stored value if the
+        // key is present, or an empty optional otherwise. Every lane in the
+        // tile receives the same result.
         template <class Tile>
-        __device__ bool get(const Tile& tile, Key key, Value& out_value) const;
+        __device__ cuda::std::optional<Value> get(const Tile& tile, Key key) const;
 
         __host__ __device__ std::size_t capacity() const noexcept { return capacity_; }
 
@@ -283,6 +284,18 @@ public:
 
     // Actual capacity (input capacity rounded up to a power of two).
     std::size_t capacity() const noexcept { return capacity_; }
+
+#ifdef GPURHH_ENABLE_INTERNAL_ACCESS
+    // Direct access to the underlying device-resident bucket array, of
+    // length `capacity() / bucket_size`. Only available when the including
+    // translation unit defines GPURHH_ENABLE_INTERNAL_ACCESS before this
+    // header is included. Provided for tests and diagnostics that need to
+    // inspect or seed table state directly via cudaMemcpy. Bypasses the
+    // table's concurrency contract — there is no synchronization against
+    // concurrent insert / get from other kernels.
+    Bucket*       data() noexcept       { return buckets_; }
+    const Bucket* data() const noexcept { return buckets_; }
+#endif
 
 private:
     Bucket*     buckets_  = nullptr;
@@ -457,8 +470,8 @@ __device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::insert(
 
 template <class K, class V, class H, K E, int CL, int WS, int MPB>
 template <class Tile>
-__device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::get(
-    const Tile& tile, K key, V& out_value) const
+__device__ cuda::std::optional<V>
+HashTable<K, V, H, E, CL, WS, MPB>::View::get(const Tile& tile, K key) const
 {
     // Bucket-level Robin Hood lookup. Probe home_bucket, then home_bucket+1,
     // etc., wrapping modulo num_buckets. Each iteration is one coalesced
@@ -485,17 +498,17 @@ __device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::get(
         const Slot slot = buckets_[bucket_idx].slots[tile.thread_rank()];
 
         // (1) Key match. The matching lane broadcasts its value to the rest
-        //     of the tile via shfl.
+        //     of the tile via shfl; each lane wraps the broadcast result in
+        //     an optional and returns it (every lane returns the same one).
         const auto match_mask = tile.ballot(slot.key == key);
         if (match_mask != 0) {
             const int matching_lane = __ffs(match_mask) - 1;
-            out_value = tile.shfl(slot.value, matching_lane);
-            return true;
+            return cuda::std::optional<V>{tile.shfl(slot.value, matching_lane)};
         }
 
         // (2) Empty slot. The key isn't in the table — Robin Hood would have
         //     placed it earlier in the probe sequence.
-        if (tile.ballot(slot.key == empty_key) != 0) return false;
+        if (tile.ballot(slot.key == empty_key) != 0) return cuda::std::nullopt;
 
         // (3) Robin Hood early termination. If any resident is "richer"
         //     (closer to its home bucket than we are to ours), our key would
@@ -505,7 +518,7 @@ __device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::get(
             (hash_(slot.key) & capacity_mask_) / bucket_size;
         const std::size_t resident_probe =
             (bucket_idx - resident_home) & bucket_mask;
-        if (tile.ballot(resident_probe < probe) != 0) return false;
+        if (tile.ballot(resident_probe < probe) != 0) return cuda::std::nullopt;
 
         // No match, no empty slot, no richer resident — every slot here is
         // occupied by a resident at least as displaced as we would be.
@@ -516,7 +529,7 @@ __device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::get(
     // without finding the key, an empty slot, or a richer resident. The
     // insert invariant guarantees the key cannot be at probe distance
     // greater than max_probe_buckets, so this is a definite "not present".
-    return false;
+    return cuda::std::nullopt;
 }
 
 } // namespace gpurhh

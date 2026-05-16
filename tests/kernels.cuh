@@ -3,7 +3,8 @@
 // Shared infrastructure for gpurhh tests: a concrete table instantiation, the
 // small driver kernels that read keys/values from device buffers, and
 // host-side helpers that wrap allocation, copy, launch, and result-readback
-// around those kernels. CUDA error checking lives in utils.cuh.
+// around those kernels. CUDA error checking and the test-only macro switch
+// live in tests.cuh.
 
 #include <cassert>
 #include <cstdint>
@@ -12,9 +13,10 @@
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
+// tests.cuh must precede the gpurhh header — it sets the
+// GPURHH_ENABLE_INTERNAL_ACCESS macro that exposes HashTable::data().
+#include "tests.cuh"
 #include <gpurhh/hash_table.cuh>
-
-#include "utils.cuh"
 
 namespace cg = cooperative_groups;
 
@@ -50,9 +52,9 @@ __global__ void insert_kernel(View view,
     }
 }
 
-// For each input key, writes (value, 1) on hit and (_, 0) on miss. We assume
-// view.get broadcasts the located value to every lane in the tile, and have
-// lane 0 perform the store to keep the store count to one per key.
+// For each input key, writes (value, 1) on hit and (_, 0) on miss.
+// view.get returns the same cuda::std::optional<Value> on every lane in the
+// tile; lane 0 performs the store to keep the store count to one per key.
 __global__ void get_kernel(View view,
                                   const std::uint32_t* keys,
                                   std::uint32_t* values_out,
@@ -68,11 +70,10 @@ __global__ void get_kernel(View view,
     const std::size_t total_tiles = gridDim.x * tiles_per_block;
 
     for (std::size_t i = tile_id; i < n; i += total_tiles) {
-        std::uint32_t v = 0;
-        const bool ok = view.get(tile, keys[i], v);
+        const auto result = view.get(tile, keys[i]);
         if (tile.thread_rank() == 0) {
-            values_out[i] = ok ? v : 0;
-            found_out[i]  = ok ? 1 : 0;
+            values_out[i] = result.value_or(0);
+            found_out[i]  = result.has_value() ? 1 : 0;
         }
     }
 }

@@ -246,7 +246,7 @@ public:
 
 The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers can call `view.insert(tile, ...)` directly.
 Bulk host-side operations are deliberately *not* part of the table — callers manage their device buffers and write their own driver kernels, which calls `view.insert` / `view.get` cooperatively from a tile of `tile_size` threads.
-The tests in `tests/common.cuh` show the canonical pattern.
+The tests in `tests/kernels.cuh` show the canonical pattern.
 
 ## Open questions / things to settle
 
