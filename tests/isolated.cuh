@@ -28,6 +28,7 @@
 #include "tests.cuh"
 #include <gpurhh/hash_table.cuh>
 
+#include <optional>
 #include <vector>
 
 namespace cg = cooperative_groups;
@@ -122,6 +123,181 @@ inline void do_insert(Table& table,
 
     cudaFree(d_keys);
     cudaFree(d_values);
+}
+
+// Insert kernel that captures per-key success/failure. `outcomes[i]` is set
+// to 0 if the i-th insert succeeded, 1 if it returned false (probe cap hit).
+template <class Table>
+__global__ void insert_many_with_outcomes_kernel(
+    typename Table::View view,
+    const typename Table::key_type* keys,
+    const typename Table::value_type* values,
+    int* outcomes,
+    std::size_t n)
+{
+    auto block = cg::this_thread_block();
+    auto tile  = cg::tiled_partition<Table::tile_size>(block);
+    const std::size_t tiles_per_block = blockDim.x / Table::tile_size;
+    const std::size_t tile_id = blockIdx.x * tiles_per_block +
+                                 threadIdx.x / Table::tile_size;
+    const std::size_t total_tiles = gridDim.x * tiles_per_block;
+    for (std::size_t i = tile_id; i < n; i += total_tiles) {
+        const bool ok = view.insert(tile, keys[i], values[i]);
+        if (tile.thread_rank() == 0) {
+            outcomes[i] = ok ? 0 : 1;
+        }
+    }
+}
+
+// Host-side bulk-insert helper that captures each insert's return value as
+// a per-key outcome (0 = succeeded, 1 = probe cap hit / failed).
+template <class Table>
+inline std::vector<int> do_insert_with_outcomes(
+    Table& table,
+    const std::vector<typename Table::key_type>& keys,
+    const std::vector<typename Table::value_type>& values)
+{
+    using Key   = typename Table::key_type;
+    using Value = typename Table::value_type;
+
+    assert(keys.size() == values.size());
+    std::vector<int> outcomes(keys.size(), 0);
+    if (keys.empty()) return outcomes;
+
+    Key*   d_keys     = nullptr;
+    Value* d_values   = nullptr;
+    int*   d_outcomes = nullptr;
+    cudaMalloc(&d_keys,     keys.size()   * sizeof(Key))   >> CUDA_CHECK;
+    cudaMalloc(&d_values,   values.size() * sizeof(Value)) >> CUDA_CHECK;
+    cudaMalloc(&d_outcomes, keys.size()   * sizeof(int))   >> CUDA_CHECK;
+    cudaMemcpy(d_keys,   keys.data(),   keys.size()   * sizeof(Key),
+               cudaMemcpyHostToDevice) >> CUDA_CHECK;
+    cudaMemcpy(d_values, values.data(), values.size() * sizeof(Value),
+               cudaMemcpyHostToDevice) >> CUDA_CHECK;
+
+    constexpr int block_size = 128;
+    const int tiles_per_block = block_size / Table::tile_size;
+    const int grid_size =
+        static_cast<int>((keys.size() + tiles_per_block - 1) / tiles_per_block);
+    insert_many_with_outcomes_kernel<Table><<<grid_size, block_size>>>(
+        table.view(), d_keys, d_values, d_outcomes, keys.size());
+    cudaGetLastError()      >> CUDA_CHECK;
+    cudaDeviceSynchronize() >> CUDA_CHECK;
+
+    cudaMemcpy(outcomes.data(), d_outcomes, keys.size() * sizeof(int),
+               cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+
+    cudaFree(d_keys);
+    cudaFree(d_values);
+    cudaFree(d_outcomes);
+    return outcomes;
+}
+
+// Single-tile get kernel: one block, one tile, looks up one key.
+template <class Table>
+__global__ void get_one_kernel(typename Table::View view,
+                               typename Table::key_type key,
+                               typename Table::value_type* value_out,
+                               int* found_out)
+{
+    auto block = cg::this_thread_block();
+    auto tile  = cg::tiled_partition<Table::tile_size>(block);
+    const auto result = view.get(tile, key);
+    if (tile.thread_rank() == 0) {
+        *value_out = result.value_or(typename Table::value_type{});
+        *found_out = result.has_value() ? 1 : 0;
+    }
+}
+
+// Host-side single-key get returning an optional value.
+template <class Table>
+inline std::optional<typename Table::value_type>
+get_one(Table& table, typename Table::key_type key)
+{
+    using Value = typename Table::value_type;
+    Value* d_value = nullptr;
+    int*   d_found = nullptr;
+    cudaMalloc(&d_value, sizeof(Value)) >> CUDA_CHECK;
+    cudaMalloc(&d_found, sizeof(int))   >> CUDA_CHECK;
+
+    get_one_kernel<Table><<<1, Table::tile_size>>>(
+        table.view(), key, d_value, d_found);
+    cudaGetLastError()      >> CUDA_CHECK;
+    cudaDeviceSynchronize() >> CUDA_CHECK;
+
+    Value value{};
+    int found = 0;
+    cudaMemcpy(&value, d_value, sizeof(Value), cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+    cudaMemcpy(&found, d_found, sizeof(int),   cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+
+    cudaFree(d_value);
+    cudaFree(d_found);
+    return found ? std::optional<Value>{value} : std::nullopt;
+}
+
+// Bulk get kernel: one tile per key, tile-strided.
+template <class Table>
+__global__ void get_many_kernel(typename Table::View view,
+                                const typename Table::key_type* keys,
+                                typename Table::value_type* values_out,
+                                int* found_out,
+                                std::size_t n)
+{
+    auto block = cg::this_thread_block();
+    auto tile  = cg::tiled_partition<Table::tile_size>(block);
+    const std::size_t tiles_per_block = blockDim.x / Table::tile_size;
+    const std::size_t tile_id = blockIdx.x * tiles_per_block +
+                                 threadIdx.x / Table::tile_size;
+    const std::size_t total_tiles = gridDim.x * tiles_per_block;
+    for (std::size_t i = tile_id; i < n; i += total_tiles) {
+        const auto result = view.get(tile, keys[i]);
+        if (tile.thread_rank() == 0) {
+            values_out[i] = result.value_or(typename Table::value_type{});
+            found_out[i]  = result.has_value() ? 1 : 0;
+        }
+    }
+}
+
+// Host-side bulk get. Resizes `values_out` and `found_out` to match keys.
+template <class Table>
+inline void do_get(Table& table,
+                   const std::vector<typename Table::key_type>& keys,
+                   std::vector<typename Table::value_type>& values_out,
+                   std::vector<int>& found_out)
+{
+    using Key   = typename Table::key_type;
+    using Value = typename Table::value_type;
+
+    values_out.assign(keys.size(), Value{});
+    found_out.assign(keys.size(), 0);
+    if (keys.empty()) return;
+
+    Key*   d_keys   = nullptr;
+    Value* d_values = nullptr;
+    int*   d_found  = nullptr;
+    cudaMalloc(&d_keys,   keys.size() * sizeof(Key))   >> CUDA_CHECK;
+    cudaMalloc(&d_values, keys.size() * sizeof(Value)) >> CUDA_CHECK;
+    cudaMalloc(&d_found,  keys.size() * sizeof(int))   >> CUDA_CHECK;
+    cudaMemcpy(d_keys, keys.data(), keys.size() * sizeof(Key),
+               cudaMemcpyHostToDevice) >> CUDA_CHECK;
+
+    constexpr int block_size = 128;
+    const int tiles_per_block = block_size / Table::tile_size;
+    const int grid_size =
+        static_cast<int>((keys.size() + tiles_per_block - 1) / tiles_per_block);
+    get_many_kernel<Table><<<grid_size, block_size>>>(
+        table.view(), d_keys, d_values, d_found, keys.size());
+    cudaGetLastError()      >> CUDA_CHECK;
+    cudaDeviceSynchronize() >> CUDA_CHECK;
+
+    cudaMemcpy(values_out.data(), d_values, keys.size() * sizeof(Value),
+               cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+    cudaMemcpy(found_out.data(), d_found, keys.size() * sizeof(int),
+               cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+
+    cudaFree(d_keys);
+    cudaFree(d_values);
+    cudaFree(d_found);
 }
 
 // Robin Hood invariant: for every occupied slot at index i, the resident's

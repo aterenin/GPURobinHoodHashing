@@ -8,40 +8,6 @@
 
 namespace {
 
-// Single-tile kernel: one block, one tile, looks up one key.
-__global__ void get_one_kernel(TestView view, std::uint32_t key,
-                               std::uint32_t* value_out, int* found_out) {
-    auto block = cg::this_thread_block();
-    auto tile  = cg::tiled_partition<TestTable::tile_size>(block);
-    const auto result = view.get(tile, key);
-    if (tile.thread_rank() == 0) {
-        *value_out = result.value_or(0);
-        *found_out = result.has_value() ? 1 : 0;
-    }
-}
-
-struct GetResult { bool found; std::uint32_t value; };
-
-GetResult get_one(TestTable& table, std::uint32_t key) {
-    std::uint32_t* d_value = nullptr;
-    int* d_found = nullptr;
-    cudaMalloc(&d_value, sizeof(std::uint32_t)) >> CUDA_CHECK;
-    cudaMalloc(&d_found, sizeof(int))           >> CUDA_CHECK;
-
-    get_one_kernel<<<1, TestTable::tile_size>>>(table.view(), key, d_value, d_found);
-    cudaGetLastError()      >> CUDA_CHECK;
-    cudaDeviceSynchronize() >> CUDA_CHECK;
-
-    std::uint32_t value = 0;
-    int found = 0;
-    cudaMemcpy(&value, d_value, sizeof(std::uint32_t), cudaMemcpyDeviceToHost) >> CUDA_CHECK;
-    cudaMemcpy(&found, d_found, sizeof(int),           cudaMemcpyDeviceToHost) >> CUDA_CHECK;
-
-    cudaFree(d_value);
-    cudaFree(d_found);
-    return {found != 0, value};
-}
-
 // Small table for all tests: capacity = 64, bucket_size = 16, num_buckets = 4.
 constexpr std::size_t kCapacity = 64;
 
@@ -54,8 +20,8 @@ void test_hit_in_home_bucket() {
     set_state(table, state);
 
     auto r = get_one(table, 5);
-    assert(r.found);
-    assert(r.value == 50);
+    assert(r.has_value());
+    assert(*r == 50);
 }
 
 void test_hit_in_second_bucket() {
@@ -73,8 +39,8 @@ void test_hit_in_second_bucket() {
     set_state(table, state);
 
     auto r = get_one(table, 64);
-    assert(r.found);
-    assert(r.value == 6400);
+    assert(r.has_value());
+    assert(*r == 6400);
 }
 
 void test_miss_in_empty_table() {
@@ -82,7 +48,7 @@ void test_miss_in_empty_table() {
     set_state(table, empty_state(table));
 
     auto r = get_one(table, 42);
-    assert(!r.found);
+    assert(!r.has_value());
 }
 
 void test_miss_via_empty_slot_in_home_bucket() {
@@ -97,7 +63,7 @@ void test_miss_via_empty_slot_in_home_bucket() {
     set_state(table, state);
 
     auto r = get_one(table, 5);
-    assert(!r.found);
+    assert(!r.has_value());
 }
 
 void test_miss_via_richer_resident() {
@@ -119,7 +85,72 @@ void test_miss_via_richer_resident() {
     set_state(table, state);
 
     auto r = get_one(table, 64);
-    assert(!r.found);
+    assert(!r.has_value());
+}
+
+// Fill the entire table with multiples of 64 (all home bucket 0). After the
+// fill, slot i holds key i*64 — which is at probe distance i / bucket_size
+// from its home bucket 0. get should find each key regardless of how
+// deeply displaced it is.
+//
+// Layout:
+//   slots  0..15 → bucket 0, probe 0
+//   slots 16..31 → bucket 1, probe 1
+//   slots 32..47 → bucket 2, probe 2
+//   slots 48..63 → bucket 3, probe 3
+void test_get_at_various_probe_distances() {
+    TestTable table(kCapacity);
+    auto state = empty_state(table);
+    for (std::size_t i = 0; i < kCapacity; ++i) {
+        state[i].key   = static_cast<std::uint32_t>(i * 64);
+        state[i].value = static_cast<std::uint32_t>(i);
+    }
+    set_state(table, state);
+
+    // One probe at each distance. The interesting case is probe distance 3
+    // — get must walk past three full buckets of residents with smaller-
+    // or-equal probe distances before reaching the match.
+    constexpr std::size_t B = TestTable::bucket_size;
+    for (std::size_t bucket = 0; bucket < kCapacity / B; ++bucket) {
+        const std::size_t slot_idx = bucket * B;
+        const std::uint32_t key = static_cast<std::uint32_t>(slot_idx * 64);
+        const auto r = get_one(table, key);
+        assert(r.has_value());
+        assert(*r == slot_idx);
+    }
+}
+
+// Wrap-around test: place a key whose home bucket is the LAST bucket, but
+// displaced by 1 (so it lives in bucket 0 — the probe sequence wraps).
+// get must walk bucket (num_buckets - 1) first, see no match / no empty /
+// no richer (the home bucket is full), advance to bucket 0 via the
+// `(bucket_idx & bucket_mask)` wrap, and find the key there.
+//
+// With capacity 64 and num_buckets 4, bucket 3 is the last. Keys with home
+// bucket 3 are those whose K & 63 falls in [48, 64), i.e., K ≡ 48..63
+// (mod 64). We fill bucket 3 with keys 48..63 (each at its home slot,
+// probe 0), then place key 48 + 64 = 112 at slot 0 (probe 1, wrapped).
+void test_get_with_wrapped_probe() {
+    TestTable table(kCapacity);
+    auto state = empty_state(table);
+    for (std::size_t i = 0; i < TestTable::bucket_size; ++i) {
+        const std::uint32_t k = static_cast<std::uint32_t>(48 + i);
+        state[48 + i] = {k, k * 10u};
+    }
+    // A second home-3 key, displaced one bucket and wrapped to bucket 0.
+    const std::uint32_t wrapped_key = 48u + 64u;  // 112; home bucket 3
+    state[0] = {wrapped_key, 1120u};
+    set_state(table, state);
+
+    auto r = get_one(table, wrapped_key);
+    assert(r.has_value());
+    assert(*r == 1120u);
+
+    // Sanity: the original home-3 residents are still findable.
+    auto r48 = get_one(table, 48);
+    assert(r48.has_value() && *r48 == 480u);
+    auto r63 = get_one(table, 63);
+    assert(r63.has_value() && *r63 == 630u);
 }
 
 } // namespace
@@ -130,6 +161,8 @@ int main() {
     test_miss_in_empty_table();
     test_miss_via_empty_slot_in_home_bucket();
     test_miss_via_richer_resident();
+    test_get_at_various_probe_distances();
+    test_get_with_wrapped_probe();
     std::printf("test_get: all tests passed.\n");
     return 0;
 }

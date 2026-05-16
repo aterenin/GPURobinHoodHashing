@@ -157,6 +157,137 @@ void test_insert_near_full() {
     assert_robin_hood_invariant(table, state);
 }
 
+// (A) probe-cap failure path. Fill the table with keys that all hash to
+// home bucket 0 — they spread across buckets 0..3 at probe distances 0..3.
+// With capacity 64 (num_buckets = 4) the effective probe bound is
+// min(MaxProbeBuckets, num_buckets) = min(8, 4) = 4, so 4 * 16 = 64 keys
+// fit exactly. A 65th home-bucket-0 key must fail.
+void test_insert_past_probe_cap_fails() {
+    TestTable table(kCapacity);
+
+    std::vector<std::uint32_t> keys, values;
+    for (std::uint32_t i = 0; i < 64; ++i) {
+        keys.push_back(i * 64);  // all multiples of 64 → home bucket 0
+        values.push_back(i);
+    }
+    const auto outcomes = do_insert_with_outcomes(table, keys, values);
+    for (int o : outcomes) assert(o == 0);
+
+    {
+        const auto state = read_state(table);
+        std::size_t occupied = 0;
+        for (const auto& slot : state) {
+            if (slot.key != TestTable::empty_key) {
+                assert(slot.key % 64 == 0);
+                ++occupied;
+            }
+        }
+        assert(occupied == 64);
+        assert_robin_hood_invariant(table, state);
+    }
+
+    // One more home-bucket-0 key. The table is exactly full; the probe loop
+    // will walk all 4 buckets, find no match / no empty / no richer
+    // resident (all residents have probe distance equal to ours), and
+    // return false.
+    const std::uint32_t over_cap_key = 64 * 64;  // 4096, also home bucket 0
+    const auto failed = do_insert_with_outcomes(table, {over_cap_key}, {999});
+    assert(failed.size() == 1);
+    assert(failed[0] == 1);
+
+    // The failed insert must not have touched the table.
+    {
+        const auto after = read_state(table);
+        std::size_t occupied = 0;
+        bool over_cap_present = false;
+        for (const auto& slot : after) {
+            if (slot.key != TestTable::empty_key) {
+                assert(slot.key % 64 == 0);
+                if (slot.key == over_cap_key) over_cap_present = true;
+                ++occupied;
+            }
+        }
+        assert(occupied == 64);
+        assert(!over_cap_present);
+        assert_robin_hood_invariant(table, after);
+    }
+}
+
+// (B) concurrent inserts of the same key. With the default replace_op
+// reduction, exactly one slot should hold the key after all inserts
+// complete, and the surviving value should be one of the inputs.
+void test_concurrent_same_key_inserts() {
+    TestTable table(kCapacity);
+
+    // 100 tiles all racing to insert key 7 with values 1..100.
+    constexpr std::size_t N = 100;
+    std::vector<std::uint32_t> keys(N, 7);
+    std::vector<std::uint32_t> values(N);
+    for (std::size_t i = 0; i < N; ++i) {
+        values[i] = static_cast<std::uint32_t>(i + 1);
+    }
+    do_insert(table, keys, values);
+
+    const auto state = read_state(table);
+
+    // Uniqueness: exactly one slot holds key 7.
+    int count = 0;
+    std::uint32_t survivor_value = 0;
+    for (const auto& slot : state) {
+        if (slot.key == 7) {
+            ++count;
+            survivor_value = slot.value;
+        }
+    }
+    assert(count == 1);
+
+    // Validity: the surviving value is one of the inputs.
+    assert(survivor_value >= 1 && survivor_value <= N);
+
+    assert_robin_hood_invariant(table, state);
+}
+
+// (A) wrap-around: insert a key whose home bucket is the last bucket,
+// when its home bucket is full. The probe sequence must wrap from bucket
+// (num_buckets - 1) to bucket 0 via `(bucket_idx & bucket_mask)`. Verify
+// the new key lands in bucket 0 (the wrapped destination) and the rest of
+// the table is unchanged.
+void test_insert_wraps_around() {
+    TestTable table(kCapacity);
+    auto state = empty_state(table);
+
+    // Fill bucket 3 (the last bucket) with 16 home-3 keys.
+    for (std::size_t i = 0; i < TestTable::bucket_size; ++i) {
+        const std::uint32_t k = static_cast<std::uint32_t>(48 + i);
+        state[48 + i] = {k, k * 10u};
+    }
+    set_state(table, state);
+
+    // Insert a second home-3 key. It must walk bucket 3 (full of equal-
+    // probe residents → no displacement, advance) and then land at bucket
+    // 0 lane 0 via the modular wrap.
+    const std::uint32_t wrapped_key = 48u + 64u;  // 112; home bucket 3
+    do_insert(table, {wrapped_key}, {1120u});
+    const auto after = read_state(table);
+
+    // The new key landed at slot 0.
+    assert(after[0].key == wrapped_key);
+    assert(after[0].value == 1120u);
+
+    // Bucket 3 unchanged.
+    for (std::size_t i = 0; i < TestTable::bucket_size; ++i) {
+        assert(after[48 + i].key   == 48u + i);
+        assert(after[48 + i].value == (48u + i) * 10u);
+    }
+
+    // Slots 1..47 still empty.
+    for (std::size_t i = 1; i < 48; ++i) {
+        assert(after[i].key == TestTable::empty_key);
+    }
+
+    assert_robin_hood_invariant(table, after);
+}
+
 } // namespace
 
 int main() {
@@ -165,6 +296,9 @@ int main() {
     test_insert_fills_home_bucket();
     test_insert_displaces_richer_resident();
     test_insert_near_full();
+    test_insert_past_probe_cap_fails();
+    test_concurrent_same_key_inserts();
+    test_insert_wraps_around();
     std::printf("test_insert: all tests passed.\n");
     return 0;
 }
