@@ -1,4 +1,7 @@
-# GPU Robin Hood Hash Table — Design Brainstorm
+# GPU Robin Hood Hash Table — Design Notes
+
+This document records the design and decisions behind `gpurhh`, a header-only CUDA library implementing a parallel Robin Hood hash table for NVIDIA GPUs.
+It covers what the library does, why it looks the way it does, the public API it exposes, how the implementation is tested, and what is deliberately out of scope.
 
 ## Goals
 
@@ -71,6 +74,27 @@ Storing it would cost bits we'd rather give to the payload, and the derivation i
   Users specify a target load factor (default 0.7); we round capacity up to `next_pow2(N / load_factor)`.
 - Hash function is a template parameter; default is a finalizer-style mixer (e.g. the splitmix64/Murmur3 finalizer) that is cheap on GPU and decorrelates structured keys well.
 - Robin Hood tolerates higher load than linear probing, but on a GPU the warp tail-latency argument pushes us back toward 0.7–0.8 rather than 0.9.
+
+## Reduction operators
+
+When `View::insert` encounters an existing entry for the same key, the new value is combined with the existing one through a `Reduction` functor — a template parameter of `HashTable`, defaulting to `gpurhh::replace_op`.
+Stateless and trivially copyable, the functor sits inside the `View` by value:
+
+```cpp
+struct replace_op {
+    template <class T>
+    __device__ T operator()(T /*existing*/, T incoming) const noexcept { return incoming; }
+};
+
+struct sum_op {
+    template <class T>
+    __device__ T operator()(T existing, T incoming) const noexcept { return existing + incoming; }
+};
+```
+
+`replace_op` gives last-writer-wins semantics. `sum_op` accumulates values for repeated-key inserts — useful as a parallel histogram or counter primitive. Users can define their own functor with the same signature.
+
+For commutative and associative reductions like `sum_op`, the final stored value is fully deterministic regardless of how the CAS retries interleave across tiles: the result is just the reduction of all inserted values for that key. For non-commutative reductions, the outcome depends on which writers win their CAS races.
 
 ## Parallel insertion algorithm
 
@@ -194,18 +218,24 @@ The same algorithm runs unchanged; only the derived constants differ.
 We are not targeting AMD, but it is the reason we want `CacheLineBytes` and `WarpSize` to be parameters of the table type rather than hard-coded `128` and `32`.
 Anything that ends up baked in as a literal in the implementation is a portability bug waiting to happen.
 
-## Lookup and deletion
+## Lookup
 
-- **Lookup.**
-  Same probing rule, no CAS.
-  Stop as soon as we find the key, an empty slot, or a resident whose probe distance is smaller than ours.
-  Lookup is fully read-only and trivially parallel — no synchronization required.
-- **Deletion.**
-  Backward-shift: starting from the deleted slot, while the next slot is non-empty and its probe distance is positive, shift it back by one.
-  On a concurrent GPU this is the hardest operation to make correct without locks.
-  **Initial scope: defer deletion**, support insert + lookup only, and add it once we have benchmarks in place.
+`View::get` follows the same probing rule as insert, read-only, returning `cuda::std::optional<Value>` — populated on hit, empty on miss. The probe terminates as soon as it sees one of:
 
-## API sketch
+- A key match → return `{value}`.
+- An empty slot → return `nullopt`. Robin Hood would have placed the key before this point.
+- A resident "richer" than ours (smaller probe distance) → return `nullopt`. Our key would have evicted that resident if it were in the table, contradiction.
+- The probe cap → return `nullopt`. The insert-side cap means the key cannot live further than this.
+
+Lookups are read-only and trivially parallel: concurrent lookups never race each other.
+
+**Concurrent get during insert is not linearizable.** A get running simultaneously with an insert can return `nullopt` for a key that is about to be inserted, or for a key in the middle of being displaced. Linearizability would require per-slot versioning. Most workloads sync between insert and get phases.
+
+## Deletion
+
+Not supported. The natural design is backward-shift deletion, but a correct lock-free implementation is significantly harder than insert/lookup, and the use case (this is an append-only table for most consumers) hasn't pushed us to do it.
+
+## Public API
 
 ```cpp
 namespace gpurhh {
@@ -214,66 +244,90 @@ template <class Key,
           class Value,
           class Hash             = default_hash<Key>,
           Key   EmptyKey         = default_empty_key<Key>::key,
+          class Reduction        = replace_op,
           int   CacheLineBytes   = 128,
           int   WarpSize         = 32,
           int   MaxProbeBuckets  = 8>
 class HashTable {
 public:
-    // Host-side: allocate and initialize the device-resident slot array.
+    // Host-side resource management. Non-copyable, movable.
     explicit HashTable(std::size_t min_capacity);
     ~HashTable();
-
-    // Non-copyable, movable.
     HashTable(HashTable&&) noexcept;
     HashTable& operator=(HashTable&&) noexcept;
 
-    // Device-side, copyable handle. Trivially passed by value into kernels.
+    // Device-side handle. Trivially copyable; pass by value into kernels.
     class View {
     public:
         template <class Tile>
         __device__ bool insert(const Tile& tile, Key key, Value value);
 
         template <class Tile>
-        __device__ bool get(const Tile& tile, Key key, Value& out) const;
+        __device__ cuda::std::optional<Value> get(const Tile& tile, Key key) const;
     };
 
     View view() const noexcept;
-    std::size_t capacity() const noexcept;  // power of two, in slots
+
+    // Actual capacity, in slots, rounded up to the next power of two and
+    // never less than `bucket_size`.
+    std::size_t capacity() const noexcept;
+
+    // Diagnostic: pretty-print a slot range to stdout. Bucket boundaries
+    // are shown; empty slots are labeled "empty".
+    void print_slots(std::size_t start, std::size_t stop) const;
+
+#ifdef GPURHH_ENABLE_INTERNAL_ACCESS
+    // Direct pointer access to the device-resident bucket array. Gated
+    // behind a macro so users must opt in explicitly; the test suite does.
+    Bucket*       data() noexcept;
+    const Bucket* data() const noexcept;
+#endif
 };
 
-} // namespace gpurhh
+}  // namespace gpurhh
 ```
 
-The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers can call `view.insert(tile, ...)` directly.
-Bulk host-side operations are deliberately *not* part of the table — callers manage their device buffers and write their own driver kernels, which calls `view.insert` / `view.get` cooperatively from a tile of `tile_size` threads.
-The tests in `tests/kernels.cuh` show the canonical pattern.
+The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers calls `view.insert(tile, ...)` or `view.get(tile, ...)` directly.
+Bulk host-side operations are deliberately *not* part of the table — callers manage their device buffers and write their own driver kernels.
+The tests in `tests/kernels.cuh` and `tests/isolated.cuh` show the canonical pattern; `examples/basic.cu` is a minimal standalone walkthrough.
 
-## Open questions / things to settle
+## Testing
 
-1. **Slot width.**
-   Both 64-bit (4+4 byte) and 128-bit (8+8 byte) packings are supported via `cuda::atomic_ref<Slot>`.
-   The 64-bit case is what current tests exercise; the 128-bit case compiles and links but uses libcu++'s lock-emulated 128-bit CAS on pre-Hopper GPUs, which is significantly slower than 64-bit CAS.
-   Open: validate the 128-bit path on a Hopper system, and benchmark.
-2. **Failure semantics on full table.**
-   `View::insert` currently returns `false` when the probe-length cap is hit.
-   Open: whether a bulk operation should return a survivor count or just a failure flag — depends on whether we add bulk operations to the API at all.
-3. **Resize.**
-   Out of scope for v1.
-   The table is allocated at a fixed capacity.
-   Users that need growth allocate a bigger one and re-insert.
-4. **Multi-GPU.**
-   Out of scope for v1.
-5. **Portability across vendors.**
-   Out of scope for v1 but informs the abstractions — see the AMD aside above.
-   `CacheLineBytes` and `WarpSize` are table-level parameters, not magic numbers in the implementation.
-6. **Testing.**
-   Basic correctness tests exist (construction, single-tile insert, single-tile get).
-   Still missing: a CPU reference for randomized differential testing; concurrency stress tests at varying load factors; probe-cap stress tests; benchmarks against `cuCollections` / `WarpCore`.
+The test suite lives in `tests/`, with each `test_*.cu` compiled into its own executable.
 
-## Suggested next steps
+- **`test_construction.cu`** — construct / destruct, move semantics, edge sizes (capacity == bucket_size, capacity below bucket_size), moved-from state behavior.
+- **`test_combined.cu`** — end-to-end insert + get round-trips through the public API.
+- **`test_get.cu`** — `View::get` in isolation. Pre-states are hand-built with `IdentityHash` so the probe sequence and home buckets are deterministic; the test then verifies `get`'s match / empty / richer-resident / wrap-around behavior.
+- **`test_insert.cu`** — `View::insert` in isolation. Some tests use hand-computed expected layouts; all run a Robin Hood invariant scanner over the final state as a safety net. Covers the probe-cap failure path and concurrent same-key inserts.
+- **`test_concurrency.cu`** — heavy parallel contention: adversarial displacement chains, many concurrent gets, mixed new / duplicate inserts, parallel saturation of the probe cap.
+- **`test_randomized.cu`** — randomized stress. Uniform-key inserts at small (4 KB table) and gigabyte (1 GB table) scales; a sum-reduction stress test with random keys and deliberate duplicates whose expected per-key sum is computed on the host.
 
-1. Smoke-test the end-to-end pipeline on a real GPU (build, run `test_construction`, `test_insert`, `test_get`).
-2. Wire up `examples/basic.cu` as a self-contained demonstration of construct + bulk insert + bulk lookup.
-3. Add randomized differential tests against a CPU reference Robin Hood implementation.
-4. Add stress tests for concurrency and load-factor edges.
-5. Benchmark against `cuCollections` / `WarpCore` to validate the bandwidth-bound claim.
+Three shared infrastructure headers:
+
+- **`tests/tests.cuh`** — the `CUDA_CHECK` postfix error-check operator (`expr >> CUDA_CHECK`) and the `GPURHH_ENABLE_INTERNAL_ACCESS` macro, which gates `HashTable::data()`.
+- **`tests/kernels.cuh`** — the `Table` alias (with `default_hash`), bulk insert/get host helpers, and end-to-end driver kernels. Used by the "combined" and construction tests.
+- **`tests/isolated.cuh`** — the `TestTable` alias (with `IdentityHash` for predictable home buckets), templated `do_insert` / `do_get` / `do_insert_with_outcomes`, the `assert_robin_hood_invariant` scanner, and `set_state` / `read_state` for direct table-memory manipulation via the `data()` back-door.
+
+The `IdentityHash` is the enabling choice for the isolated tests: with `hash(K) = K`, the home bucket of a key is fully predictable from its value, so we can construct any valid Robin Hood state with one `cudaMemcpy` and hand-predict the outcome of small insert sequences. The randomized tests apply a bit-mixing function (the same `fmix32` finalizer used by `default_hash`) as a permutation on sequential integers — this gives distinct random-looking keys without the host-side dedup overhead that an `unordered_set` would require, which is what makes the gigabyte-scale tests fit in memory.
+
+The test suite runs about 34 tests across ~1100 lines of code, against ~350 lines of library code. The high ratio is deliberate: this is a concurrent data structure, and the failure modes for concurrent CAS retries, displacement chains, and probe-cap interactions are subtle enough that we put significant effort into checking each path.
+
+## Known limitations
+
+- **Deletion** is not supported. Users that need it allocate a fresh table and re-insert.
+- **Resize** is not supported. Users that need growth allocate a bigger table and re-insert.
+- **Multi-GPU** is not supported.
+- **Concurrent get during insert is not linearizable.** A get running simultaneously with insert can return `nullopt` for a key in flight. Workloads should synchronize between insert and get phases.
+- **128-bit slot performance on pre-Hopper hardware** (sm_70–sm_89) is bottlenecked by libcu++'s lock-table emulation of 128-bit CAS. Functionally correct, but considerably slower than the native single-instruction path that sm_90+ has.
+
+## Out of scope
+
+- **Non-NVIDIA backends.** The abstractions (`CacheLineBytes` and `WarpSize` as table-level template parameters) don't preclude AMD support, but we haven't written or tested it. The same algorithm with AMD's 64-byte cache line and 64-thread wavefront would give `BucketSize = 8` and `TilesPerWarp = 8`.
+- **Stream support.** All operations currently run on the default stream. Adding a `cudaStream_t` parameter to host-side methods is a small change but hasn't been made.
+
+## Future work
+
+- Validate the 128-bit slot path on a Hopper (sm_90+) system; benchmark it against the 64-bit path.
+- Benchmark against `cuCollections` and `WarpCore` on the same workloads to validate the bandwidth-bound claim.
+- Add a CPU reference Robin Hood for randomized differential testing if test signal demands it (currently considered low priority — the invariant scanner plus the sum-reduction equivalence check cover most of what differential testing would add).
+- Implement deletion (backward-shift, lock-free) if a use case appears.
