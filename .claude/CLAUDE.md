@@ -23,7 +23,7 @@ The design target is bandwidth-bound performance on large tables.
   They are intended to eventually become the project's documentation, but they are not documentation yet — they are working notes that capture decisions as we make them.
   Read these before touching code.
 - `Makefile` — builds tests and examples with `nvcc`. Defaults to C++20, `sm_89`, and no optimization.
-  Build modes: `make` (no `-O`), `make release` (`-O2`), `make debug` (`-O0 -G -g`).
+  Build modes: `make` (no `-O`), `make release` (`-O3`), `make debug` (`-O0 -G -g`).
   Other useful targets: `make test` builds and runs all tests, `make clean` wipes `build/`. Override flags via env vars (`make ARCH=sm_90 CXX_STD=c++17`).
 
 When new design decisions are made or revised, update the relevant note in `notes/` rather than scattering rationale across commit messages or code comments.

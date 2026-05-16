@@ -6,14 +6,15 @@
 #
 # Build modes (pick at invocation time):
 #   make            no optimization flags passed (nvcc's default); the default
-#   make release    optimized build (-O2)
+#   make release    optimized build (-O3)
 #   make debug      unoptimized + host/device debug info (-O0 -G -g)
 #
 # Common overrides:
 #   make NVCC=/path/to/nvcc
 #   make ARCH=sm_75
 #   make CXX_STD=c++17
-#   make OPT="-O3 -lineinfo"   # bypass the mode selection entirely
+#   make OPT="-O3 -lineinfo"      # replace the mode-driven OPT entirely
+#   make tests EXTRA=-lineinfo    # add extra flags on top of the mode
 
 NVCC    ?= nvcc
 CXX_STD ?= c++20
@@ -22,7 +23,7 @@ ARCH    ?= sm_89
 # Pick optimization flags based on the goal that was passed on the command
 # line. Falls through to -O0 for plain `make` or any non-mode goal.
 ifneq (,$(filter release,$(MAKECMDGOALS)))
-    OPT ?= -O2
+    OPT ?= -O3
 else ifneq (,$(filter debug,$(MAKECMDGOALS)))
     OPT ?= -O0 -G -g
 else
@@ -30,7 +31,12 @@ else
 endif
 
 INCLUDES   := -Iinclude
-NVCC_FLAGS := -std=$(CXX_STD) -arch=$(ARCH) $(OPT) $(INCLUDES)
+
+# Extra nvcc flags appended on top of the mode-driven OPT. Repeated flags
+# (e.g. a second -O) get last-one-wins semantics from nvcc.
+EXTRA      ?=
+
+NVCC_FLAGS := -std=$(CXX_STD) -arch=$(ARCH) $(OPT) $(INCLUDES) $(EXTRA)
 
 BUILD := build
 
