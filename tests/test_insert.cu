@@ -142,16 +142,20 @@ void assert_robin_hood_invariant(const std::vector<TestTable::Slot>& state) {
 // Small table: capacity 64, bucket_size 16, num_buckets 4.
 constexpr std::size_t kCapacity = 64;
 
-// (A) single key inserted into empty table lands at its home slot.
+// (A) single key inserted into empty table lands in its home bucket.
+// Note: in bucket-level Robin Hood the slot-within-bucket position is
+// decided by __ffs picking the lowest empty lane, not by the key's value.
+// So for key 5 (home bucket 0) into an empty bucket, the key lands at
+// slot 0 — the first empty lane — not at slot 5.
 void test_insert_single_key_into_empty_table() {
     TestTable table(kCapacity);
     do_insert(table, {5}, {50});
     auto state = read_state(table);
 
-    assert(state[5].key == 5);
-    assert(state[5].value == 50);
-    for (std::size_t i = 0; i < kCapacity; ++i) {
-        if (i != 5) assert(state[i].key == TestTable::empty_key);
+    assert(state[0].key == 5);
+    assert(state[0].value == 50);
+    for (std::size_t i = 1; i < kCapacity; ++i) {
+        assert(state[i].key == TestTable::empty_key);
     }
     assert_robin_hood_invariant(state);
 }
