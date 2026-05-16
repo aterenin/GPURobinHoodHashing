@@ -1,24 +1,12 @@
 // Isolated tests for gpurhh::HashTable::View::get.
 //
-// We use an IdentityHash so that key K maps deterministically to home
-// slot (K & capacity_mask) and home bucket (K & capacity_mask) / bucket_size.
-// This lets us hand-build any valid Robin Hood state on the host, write
-// it directly into the table via cudaMemcpy, and then verify that get
-// returns the expected result — all without invoking View::insert.
+// Each test cudaMemcpys a hand-built state into the table via set_state
+// and then verifies that get returns the expected result. This exercises
+// View::get independently of View::insert.
 
-#include "kernels.cuh"
-
-#include <vector>
+#include "isolated.cuh"
 
 namespace {
-
-// Identity hash for predictable bucket placement.
-struct IdentityHash {
-    __device__ std::uint32_t operator()(std::uint32_t k) const noexcept { return k; }
-};
-
-using TestTable = gpurhh::HashTable<std::uint32_t, std::uint32_t, IdentityHash>;
-using TestView  = TestTable::View;
 
 // Single-tile kernel: one block, one tile, looks up one key.
 __global__ void get_one_kernel(TestView view, std::uint32_t key,
@@ -32,26 +20,8 @@ __global__ void get_one_kernel(TestView view, std::uint32_t key,
     }
 }
 
-// --- Host-side helpers ---------------------------------------------------
-
-// Construct an all-empty state with `capacity` slots.
-std::vector<TestTable::Slot> empty_state(std::size_t capacity) {
-    return std::vector<TestTable::Slot>(capacity, {TestTable::empty_key, 0});
-}
-
-// cudaMemcpy a host-built state directly into the table's bucket array.
-// The flat Slot[] layout matches Bucket[N] layout because bucket_size *
-// sizeof(Slot) == sizeof(Bucket) with no internal padding.
-void set_state(TestTable& table, const std::vector<TestTable::Slot>& host_slots) {
-    assert(host_slots.size() == table.capacity());
-    cudaMemcpy(table.data(), host_slots.data(),
-               host_slots.size() * sizeof(TestTable::Slot),
-               cudaMemcpyHostToDevice) >> CUDA_CHECK;
-}
-
 struct GetResult { bool found; std::uint32_t value; };
 
-// Look up one key and return the result.
 GetResult get_one(TestTable& table, std::uint32_t key) {
     std::uint32_t* d_value = nullptr;
     int* d_found = nullptr;
@@ -72,8 +42,6 @@ GetResult get_one(TestTable& table, std::uint32_t key) {
     return {found != 0, value};
 }
 
-// --- Tests ---------------------------------------------------------------
-
 // Small table for all tests: capacity = 64, bucket_size = 16, num_buckets = 4.
 constexpr std::size_t kCapacity = 64;
 
@@ -81,7 +49,7 @@ void test_hit_in_home_bucket() {
     // Place (5, 50) at slot 5 — its home slot. Lookup should find it
     // immediately in the first probe.
     TestTable table(kCapacity);
-    auto state = empty_state(kCapacity);
+    auto state = empty_state(table);
     state[5] = {5, 50};
     set_state(table, state);
 
@@ -96,7 +64,7 @@ void test_hit_in_second_bucket() {
     // Get(64) should probe bucket 0 (no hit, no empty, no richer because
     // every resident has probe 0 == ours) and advance to bucket 1.
     TestTable table(kCapacity);
-    auto state = empty_state(kCapacity);
+    auto state = empty_state(table);
     for (std::size_t i = 0; i < TestTable::bucket_size; ++i) {
         state[i] = {static_cast<std::uint32_t>(i),
                     static_cast<std::uint32_t>(i * 10)};
@@ -111,7 +79,7 @@ void test_hit_in_second_bucket() {
 
 void test_miss_in_empty_table() {
     TestTable table(kCapacity);
-    set_state(table, empty_state(kCapacity));
+    set_state(table, empty_state(table));
 
     auto r = get_one(table, 42);
     assert(!r.found);
@@ -123,7 +91,7 @@ void test_miss_via_empty_slot_in_home_bucket() {
     // ballot — Robin Hood would have placed it at one of those empties,
     // so it isn't in the table.
     TestTable table(kCapacity);
-    auto state = empty_state(kCapacity);
+    auto state = empty_state(table);
     state[0] = {0, 100};
     state[1] = {1, 101};
     set_state(table, state);
@@ -140,7 +108,7 @@ void test_miss_via_richer_resident() {
     // Advance to bucket 1 (our probe now 1): residents have probe 0 < ours.
     // Richer-resident termination fires → return nullopt.
     TestTable table(kCapacity);
-    auto state = empty_state(kCapacity);
+    auto state = empty_state(table);
     for (std::size_t i = 0; i < TestTable::bucket_size; ++i) {
         state[i] = {static_cast<std::uint32_t>(i), 0};
     }

@@ -1,7 +1,5 @@
 // Isolated tests for gpurhh::HashTable::View::insert.
 //
-// We use an IdentityHash so that key K maps deterministically to home
-// slot (K & capacity_mask) and home bucket (K & capacity_mask) / bucket_size.
 // Each test:
 //   - Optionally seeds a pre-state via cudaMemcpy (so the test runs against
 //     a controlled starting layout, independent of insert correctness).
@@ -13,131 +11,11 @@
 // Tests use both (A) and (B) — (A) for cases where the parallel insertion
 // outcome is hand-predictable, (B) as a safety net everywhere else.
 
-#include "kernels.cuh"
+#include "isolated.cuh"
 
 #include <algorithm>
-#include <vector>
 
 namespace {
-
-// Identity hash for predictable bucket placement.
-struct IdentityHash {
-    __device__ std::uint32_t operator()(std::uint32_t k) const noexcept { return k; }
-};
-
-using TestTable = gpurhh::HashTable<std::uint32_t, std::uint32_t, IdentityHash>;
-using TestView  = TestTable::View;
-
-// Insertion kernel: one tile per (key, value) pair, tile-strided over n.
-__global__ void insert_many_kernel(TestView view,
-                                   const std::uint32_t* keys,
-                                   const std::uint32_t* values,
-                                   std::size_t n) {
-    auto block = cg::this_thread_block();
-    auto tile  = cg::tiled_partition<TestTable::tile_size>(block);
-    const std::size_t tiles_per_block = blockDim.x / TestTable::tile_size;
-    const std::size_t tile_id = blockIdx.x * tiles_per_block +
-                                 threadIdx.x / TestTable::tile_size;
-    const std::size_t total_tiles = gridDim.x * tiles_per_block;
-    for (std::size_t i = tile_id; i < n; i += total_tiles) {
-        view.insert(tile, keys[i], values[i]);
-    }
-}
-
-// --- Host-side helpers ---------------------------------------------------
-
-std::vector<TestTable::Slot> empty_state(std::size_t capacity) {
-    return std::vector<TestTable::Slot>(capacity, {TestTable::empty_key, 0});
-}
-
-void set_state(TestTable& table, const std::vector<TestTable::Slot>& host_slots) {
-    assert(host_slots.size() == table.capacity());
-    cudaMemcpy(table.data(), host_slots.data(),
-               host_slots.size() * sizeof(TestTable::Slot),
-               cudaMemcpyHostToDevice) >> CUDA_CHECK;
-}
-
-std::vector<TestTable::Slot> read_state(const TestTable& table) {
-    std::vector<TestTable::Slot> result(table.capacity());
-    cudaMemcpy(result.data(), table.data(),
-               result.size() * sizeof(TestTable::Slot),
-               cudaMemcpyDeviceToHost) >> CUDA_CHECK;
-    return result;
-}
-
-// Run a batch of inserts.
-void do_insert(TestTable& table,
-               const std::vector<std::uint32_t>& keys,
-               const std::vector<std::uint32_t>& values) {
-    assert(keys.size() == values.size());
-    if (keys.empty()) return;
-
-    std::uint32_t *d_keys = nullptr, *d_values = nullptr;
-    cudaMalloc(&d_keys,   keys.size()   * sizeof(std::uint32_t)) >> CUDA_CHECK;
-    cudaMalloc(&d_values, values.size() * sizeof(std::uint32_t)) >> CUDA_CHECK;
-    cudaMemcpy(d_keys,   keys.data(),   keys.size()   * sizeof(std::uint32_t),
-               cudaMemcpyHostToDevice) >> CUDA_CHECK;
-    cudaMemcpy(d_values, values.data(), values.size() * sizeof(std::uint32_t),
-               cudaMemcpyHostToDevice) >> CUDA_CHECK;
-
-    constexpr int block_size = 128;
-    const int tiles_per_block = block_size / TestTable::tile_size;
-    const int grid_size =
-        static_cast<int>((keys.size() + tiles_per_block - 1) / tiles_per_block);
-    insert_many_kernel<<<grid_size, block_size>>>(
-        table.view(), d_keys, d_values, keys.size());
-    cudaGetLastError()      >> CUDA_CHECK;
-    cudaDeviceSynchronize() >> CUDA_CHECK;
-
-    cudaFree(d_keys);
-    cudaFree(d_values);
-}
-
-// Robin Hood invariant: for every occupied slot at index i, the resident's
-// home bucket H_R satisfies (i / bucket_size - H_R) mod num_buckets ≤ probe
-// cap, AND every bucket strictly between H_R and i / bucket_size is fully
-// occupied (no empty slot). The second condition is the key invariant: an
-// empty slot at distance < the resident's actual probe would mean the
-// resident should have been placed there instead.
-void assert_robin_hood_invariant(const std::vector<TestTable::Slot>& state) {
-    constexpr auto B = static_cast<std::size_t>(TestTable::bucket_size);
-    const auto num_buckets = state.size() / B;
-    const auto cap_mask = state.size() - 1;
-
-    // Pre-compute which buckets contain at least one empty slot.
-    std::vector<bool> bucket_has_empty(num_buckets, false);
-    for (std::size_t b = 0; b < num_buckets; ++b) {
-        for (std::size_t s = 0; s < B; ++s) {
-            if (state[b * B + s].key == TestTable::empty_key) {
-                bucket_has_empty[b] = true;
-                break;
-            }
-        }
-    }
-
-    for (std::size_t i = 0; i < state.size(); ++i) {
-        if (state[i].key == TestTable::empty_key) continue;
-
-        const std::size_t home_bucket = (state[i].key & cap_mask) / B;
-        const std::size_t this_bucket = i / B;
-        const std::size_t probe =
-            (this_bucket + num_buckets - home_bucket) % num_buckets;
-
-        // Probe distance must be within the cap.
-        assert(probe < static_cast<std::size_t>(TestTable::max_probe_buckets));
-
-        // Every bucket strictly between home and this one must be fully
-        // occupied; otherwise the resident should have been placed earlier.
-        for (std::size_t step = 0; step < probe; ++step) {
-            const std::size_t b = (home_bucket + step) % num_buckets;
-            assert(!bucket_has_empty[b] &&
-                   "Robin Hood invariant violated: an earlier bucket has an "
-                   "empty slot that this resident could have occupied");
-        }
-    }
-}
-
-// --- Tests ---------------------------------------------------------------
 
 // Small table: capacity 64, bucket_size 16, num_buckets 4.
 constexpr std::size_t kCapacity = 64;
@@ -157,7 +35,7 @@ void test_insert_single_key_into_empty_table() {
     for (std::size_t i = 1; i < kCapacity; ++i) {
         assert(state[i].key == TestTable::empty_key);
     }
-    assert_robin_hood_invariant(state);
+    assert_robin_hood_invariant(table, state);
 }
 
 // (A) keys with distinct home buckets all land at their home slots.
@@ -170,7 +48,7 @@ void test_insert_keys_into_distinct_home_buckets() {
     assert(state[16].key == 16 && state[16].value == 200);
     assert(state[32].key == 32 && state[32].value == 300);
     assert(state[48].key == 48 && state[48].value == 400);
-    assert_robin_hood_invariant(state);
+    assert_robin_hood_invariant(table, state);
 }
 
 // (B) fill bucket 0 with 16 home-0 keys. No displacement: every key has
@@ -200,7 +78,7 @@ void test_insert_fills_home_bucket() {
     for (std::size_t i = 16; i < kCapacity; ++i) {
         assert(state[i].key == TestTable::empty_key);
     }
-    assert_robin_hood_invariant(state);
+    assert_robin_hood_invariant(table, state);
 }
 
 // (A) deterministic displacement: start from a pre-state where bucket 0 is
@@ -213,7 +91,7 @@ void test_insert_fills_home_bucket() {
 // bucket 2's first empty slot (lane 0 → slot 32).
 void test_insert_displaces_richer_resident() {
     TestTable table(kCapacity);
-    auto state = empty_state(kCapacity);
+    auto state = empty_state(table);
     for (std::size_t i = 0; i < 32; ++i) {
         state[i] = {static_cast<std::uint32_t>(i),
                     static_cast<std::uint32_t>(i * 10)};
@@ -246,7 +124,7 @@ void test_insert_displaces_richer_resident() {
         assert(after[i].key == TestTable::empty_key);
     }
 
-    assert_robin_hood_invariant(after);
+    assert_robin_hood_invariant(table, after);
 }
 
 // (B) near-full table: 45 keys = load factor 0.7. Keys 1..45 have home
@@ -276,7 +154,7 @@ void test_insert_near_full() {
     for (std::size_t i = 0; i < N; ++i) expected[i] = static_cast<std::uint32_t>(i + 1);
     assert(keys_seen == expected);
 
-    assert_robin_hood_invariant(state);
+    assert_robin_hood_invariant(table, state);
 }
 
 } // namespace

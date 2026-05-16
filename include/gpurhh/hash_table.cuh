@@ -123,6 +123,28 @@ struct default_hash<Key, 8> {
 };
 
 // -----------------------------------------------------------------------------
+// Reduction operators applied by View::insert when an existing key is hit.
+// -----------------------------------------------------------------------------
+//
+// Called as `reduce(existing_value, incoming_value)`; the returned value is
+// stored in the slot via the same atomic CAS that the insertion would do.
+// Stateless and trivially copyable so they sit inside a View by value.
+
+struct replace_op {
+    template <class T>
+    __device__ T operator()(T /*existing*/, T incoming) const noexcept {
+        return incoming;
+    }
+};
+
+struct sum_op {
+    template <class T>
+    __device__ T operator()(T existing, T incoming) const noexcept {
+        return existing + incoming;
+    }
+};
+
+// -----------------------------------------------------------------------------
 // HashTable: host-side owner of the device-resident slot array.
 // -----------------------------------------------------------------------------
 
@@ -131,6 +153,7 @@ template <
     class Value,
     class Hash             = default_hash<Key>,
     Key   EmptyKey         = default_empty_key<Key>::key,
+    class Reduction        = replace_op,
     int   CacheLineBytes   = 128,
     int   WarpSize         = 32,
     int   MaxProbeBuckets  = 8
@@ -261,6 +284,7 @@ public:
         std::size_t capacity_      = 0;   // power of two, in slots
         std::size_t capacity_mask_ = 0;   // capacity_ - 1, for modulo via AND
         Hash        hash_{};
+        Reduction   reduce_{};
     };
 
     // -------------------------------------------------------------------------
@@ -311,8 +335,8 @@ private:
 // methods (constructor, destructor, move ops, view) are implemented; the
 // device-side View::insert and View::get bodies are still TODO.
 
-template <class K, class V, class H, K E, int CL, int WS, int MPB>
-HashTable<K, V, H, E, CL, WS, MPB>::HashTable(std::size_t min_capacity) {
+template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
+HashTable<K, V, H, E, R, CL, WS, MPB>::HashTable(std::size_t min_capacity) {
     // Round up to the next power of two, but never below a single bucket —
     // the bucketed probing logic requires at least bucket_size slots.
     const std::size_t rounded = detail::next_pow2(min_capacity);
@@ -331,23 +355,23 @@ HashTable<K, V, H, E, CL, WS, MPB>::HashTable(std::size_t min_capacity) {
     cudaMemset(buckets_, empty_key_byte, num_buckets * sizeof(Bucket));
 }
 
-template <class K, class V, class H, K E, int CL, int WS, int MPB>
-HashTable<K, V, H, E, CL, WS, MPB>::~HashTable() {
+template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
+HashTable<K, V, H, E, R, CL, WS, MPB>::~HashTable() {
     // cudaFree(nullptr) is a documented no-op, so no need to guard.
     cudaFree(buckets_);
 }
 
-template <class K, class V, class H, K E, int CL, int WS, int MPB>
-HashTable<K, V, H, E, CL, WS, MPB>::HashTable(HashTable&& other) noexcept
+template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
+HashTable<K, V, H, E, R, CL, WS, MPB>::HashTable(HashTable&& other) noexcept
     : buckets_(other.buckets_), capacity_(other.capacity_)
 {
     other.buckets_  = nullptr;
     other.capacity_ = 0;
 }
 
-template <class K, class V, class H, K E, int CL, int WS, int MPB>
-HashTable<K, V, H, E, CL, WS, MPB>&
-HashTable<K, V, H, E, CL, WS, MPB>::operator=(HashTable&& other) noexcept {
+template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
+HashTable<K, V, H, E, R, CL, WS, MPB>&
+HashTable<K, V, H, E, R, CL, WS, MPB>::operator=(HashTable&& other) noexcept {
     if (this != &other) {
         // Free the current allocation before taking ownership of the new one.
         // cudaFree(nullptr) is a no-op, so this is safe even if *this is in
@@ -361,9 +385,9 @@ HashTable<K, V, H, E, CL, WS, MPB>::operator=(HashTable&& other) noexcept {
     return *this;
 }
 
-template <class K, class V, class H, K E, int CL, int WS, int MPB>
-typename HashTable<K, V, H, E, CL, WS, MPB>::View
-HashTable<K, V, H, E, CL, WS, MPB>::view() const noexcept {
+template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
+typename HashTable<K, V, H, E, R, CL, WS, MPB>::View
+HashTable<K, V, H, E, R, CL, WS, MPB>::view() const noexcept {
     View v;
     v.buckets_       = buckets_;
     v.capacity_      = capacity_;
@@ -376,9 +400,9 @@ HashTable<K, V, H, E, CL, WS, MPB>::view() const noexcept {
     return v;
 }
 
-template <class K, class V, class H, K E, int CL, int WS, int MPB>
+template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
 template <class Tile>
-__device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::insert(
+__device__ bool HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
     const Tile& tile, K key, V value)
 {
     // Bucketed Robin Hood insertion with lock-free CAS. The tile carries an
@@ -408,12 +432,18 @@ __device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::insert(
 
         // Helper: `target_lane` performs an atomic CAS to replace its slot
         // (whose current contents we have in `slot`) with the in-flight
-        // pair. Returns the broadcast result of the CAS to every lane.
-        auto try_cas = [&](int target_lane) -> bool {
+        // pair. On the match case the new value is computed as
+        // `reduce_(existing, incoming)`; on the empty / displaceable cases
+        // the new value is just the incoming value. Returns the broadcast
+        // result of the CAS to every lane.
+        auto try_cas = [&](int target_lane, bool apply_reduction) -> bool {
             bool cas_ok = false;
             if (tile.thread_rank() == target_lane) {
+                const V to_store = apply_reduction
+                    ? reduce_(slot.value, cur_value)
+                    : cur_value;
                 Slot expected = slot;
-                const Slot desired{cur_key, cur_value};
+                const Slot desired{cur_key, to_store};
                 cuda::atomic_ref<Slot, cuda::thread_scope_device> atomic_slot(
                     buckets_[bucket_idx].slots[target_lane]);
                 cas_ok = atomic_slot.compare_exchange_strong(expected, desired);
@@ -421,17 +451,18 @@ __device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::insert(
             return tile.shfl(cas_ok, target_lane);
         };
 
-        // (1) Key match — update the existing entry's value.
+        // (1) Key match — combine the in-flight value with the existing one
+        //     via the Reduction operator (default: replace).
         const auto match_mask = tile.ballot(slot.key == cur_key);
         if (match_mask != 0) {
-            if (try_cas(__ffs(match_mask) - 1)) return true;
+            if (try_cas(__ffs(match_mask) - 1, /*apply_reduction=*/true)) return true;
             continue;  // CAS lost the race — retry this bucket.
         }
 
         // (2) Empty slot — claim it for our in-flight pair.
         const auto empty_mask = tile.ballot(slot.key == empty_key);
         if (empty_mask != 0) {
-            if (try_cas(__ffs(empty_mask) - 1)) return true;
+            if (try_cas(__ffs(empty_mask) - 1, /*apply_reduction=*/false)) return true;
             continue;  // Someone else took the slot — retry.
         }
 
@@ -446,7 +477,7 @@ __device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::insert(
         const auto displaceable_mask = tile.ballot(resident_probe < probe);
         if (displaceable_mask != 0) {
             const int target_lane = __ffs(displaceable_mask) - 1;
-            if (try_cas(target_lane)) {
+            if (try_cas(target_lane, /*apply_reduction=*/false)) {
                 // Adopt the evicted pair as our new in-flight pair. We
                 // continue from the next bucket; the evicted pair's probe
                 // distance there is `resident_probe + 1`.
@@ -468,10 +499,10 @@ __device__ bool HashTable<K, V, H, E, CL, WS, MPB>::View::insert(
     return false;
 }
 
-template <class K, class V, class H, K E, int CL, int WS, int MPB>
+template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
 template <class Tile>
 __device__ cuda::std::optional<V>
-HashTable<K, V, H, E, CL, WS, MPB>::View::get(const Tile& tile, K key) const
+HashTable<K, V, H, E, R, CL, WS, MPB>::View::get(const Tile& tile, K key) const
 {
     // Bucket-level Robin Hood lookup. Probe home_bucket, then home_bucket+1,
     // etc., wrapping modulo num_buckets. Each iteration is one coalesced
