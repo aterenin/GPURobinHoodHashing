@@ -142,9 +142,9 @@ __global__ void insert_many_with_outcomes_kernel(
                                  threadIdx.x / Table::tile_size;
     const std::size_t total_tiles = gridDim.x * tiles_per_block;
     for (std::size_t i = tile_id; i < n; i += total_tiles) {
-        const bool ok = view.insert(tile, keys[i], values[i]);
+        const auto leftover = view.insert(tile, keys[i], values[i]);
         if (tile.thread_rank() == 0) {
-            outcomes[i] = ok ? 0 : 1;
+            outcomes[i] = leftover.has_value() ? 1 : 0;
         }
     }
 }

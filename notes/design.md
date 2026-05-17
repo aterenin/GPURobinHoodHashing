@@ -138,6 +138,9 @@ The bandwidth strategy follows from this:
   Exposed as a `MaxProbeBuckets` template parameter (default 8).
   An insert that would place a key past the cap fails (the caller is expected to rehash); a get that probes the cap without finding the key returns "not found" (correct because of the insert-side cap).
   With Robin Hood at load factor ~0.85 and `bucket_size` 16, the expected longest probe is well under the default cap; the cap protects against adversarial inputs and very high load factors.
+  Crucially, a failing insert hands the leftover `(key, value)` back to the caller via the return value rather than dropping it on the floor.
+  This matters because the leftover may not be the original input: if Robin Hood displacements happened during the probe, the originally-passed-in pair is already in the table and the leftover is the most-recently-evicted victim.
+  Returning it is what makes the operation lossless under failure — callers can buffer leftovers and replay them into a rebuilt larger table.
 - **Avoid divergence.**
   All threads in a warp execute the same probe loop.
   The "I'm done, others aren't" case is handled with masked operations rather than early-return-then-divergence.
@@ -260,7 +263,11 @@ public:
     class View {
     public:
         template <class Tile>
-        __device__ bool insert(const Tile& tile, Key key, Value value);
+        // Returns nullopt on success; on probe-cap failure returns the
+        // leftover Slot that could not be placed (may be the original
+        // pair, or a Robin Hood victim displaced before the failure).
+        __device__ cuda::std::optional<Slot>
+        insert(const Tile& tile, Key key, Value value);
 
         template <class Tile>
         __device__ cuda::std::optional<Value> get(const Tile& tile, Key key) const;

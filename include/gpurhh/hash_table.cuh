@@ -265,9 +265,20 @@ public:
     public:
         // Cooperative single-key insert.
         // Called by a tile of exactly tile_size threads in lock-step. Returns
-        // true on success, false if the table is full (probe length cap hit).
+        // nullopt on success (the in-flight pair was placed in an empty slot
+        // or merged into an existing slot via the Reduction operator).
+        //
+        // On probe-cap failure returns the leftover Slot that could not be
+        // placed. Note this is not necessarily the (key, value) originally
+        // passed in: if the insertion triggered Robin Hood displacements
+        // before failing, the returned Slot is the most-recently-evicted
+        // victim — the originally-passed-in pair is already in the table,
+        // and it is the victim that is now unreachable. Callers that need
+        // to avoid data loss should buffer the returned Slot and retry it
+        // elsewhere (typically by rebuilding a larger table).
         template <class Tile>
-        __device__ bool insert(const Tile& tile, Key key, Value value);
+        __device__ cuda::std::optional<Slot> insert(
+            const Tile& tile, Key key, Value value);
 
         // Cooperative single-key lookup. Returns the stored value if the
         // key is present, or an empty optional otherwise. Every lane in the
@@ -403,8 +414,9 @@ HashTable<K, V, H, E, R, CL, WS, MPB>::view() const noexcept {
 
 template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
 template <class Tile>
-__device__ bool HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
+__device__ auto HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
     const Tile& tile, K key, V value)
+    -> cuda::std::optional<Slot>
 {
     // Bucketed Robin Hood insertion with lock-free CAS. The tile carries an
     // in-flight pair (cur_key, cur_value) that may change due to Robin Hood
@@ -456,14 +468,16 @@ __device__ bool HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
         //     via the Reduction operator (default: replace).
         const auto match_mask = tile.ballot(slot.key == cur_key);
         if (match_mask != 0) {
-            if (try_cas(__ffs(match_mask) - 1, /*apply_reduction=*/true)) return true;
+            if (try_cas(__ffs(match_mask) - 1, /*apply_reduction=*/true))
+                return cuda::std::nullopt;
             continue;  // CAS lost the race — retry this bucket.
         }
 
         // (2) Empty slot — claim it for our in-flight pair.
         const auto empty_mask = tile.ballot(slot.key == empty_key);
         if (empty_mask != 0) {
-            if (try_cas(__ffs(empty_mask) - 1, /*apply_reduction=*/false)) return true;
+            if (try_cas(__ffs(empty_mask) - 1, /*apply_reduction=*/false))
+                return cuda::std::nullopt;
             continue;  // Someone else took the slot — retry.
         }
 
@@ -495,9 +509,12 @@ __device__ bool HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
         ++probe;
     }
 
-    // Probe budget exhausted. Caller is expected to rehash into a larger
-    // table or accept the failure.
-    return false;
+    // Probe budget exhausted. Hand the in-flight pair back so the caller
+    // can buffer it and rehash into a larger table. This is the original
+    // (key, value) if no displacement happened, or the most-recently-
+    // evicted victim otherwise — either way, returning it is what keeps
+    // the operation lossless.
+    return Slot{cur_key, cur_value};
 }
 
 template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
