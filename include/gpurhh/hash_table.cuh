@@ -18,9 +18,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <type_traits>
-#include <vector>
 
 #include <cooperative_groups.h>
 #include <cuda/atomic>
@@ -323,12 +321,6 @@ public:
     const Bucket* data() const noexcept { return buckets_; }
 #endif
 
-    // Pretty-print slots in [start, stop) to stdout, with bucket
-    // boundaries marked. Provided for debugging and diagnostics; copies
-    // (stop - start) slots from device to host and is not synchronized
-    // against concurrent insert / get from other kernels.
-    void print_slots(std::size_t start, std::size_t stop) const;
-
 private:
     Bucket*     buckets_  = nullptr;
     std::size_t capacity_ = 0;  // in slots
@@ -407,56 +399,6 @@ HashTable<K, V, H, E, R, CL, WS, MPB>::view() const noexcept {
     // v.hash_ and v.reduce_ are default-constructed by View's in-class
     // default initializers.
     return v;
-}
-
-template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
-void HashTable<K, V, H, E, R, CL, WS, MPB>::print_slots(
-    std::size_t start, std::size_t stop) const
-{
-    if (start >= stop || stop > capacity_) {
-        std::printf("print_slots: invalid range [%zu, %zu) (capacity = %zu)\n",
-                    start, stop, capacity_);
-        return;
-    }
-
-    // Copy the requested slot range to host. The Bucket array is laid out
-    // such that reinterpreting it as a flat Slot[] is byte-equivalent —
-    // bucket_size * sizeof(Slot) == sizeof(Bucket) with no internal padding.
-    const std::size_t n = stop - start;
-    std::vector<Slot> host_slots(n);
-    cudaMemcpy(host_slots.data(),
-               reinterpret_cast<const Slot*>(buckets_) + start,
-               n * sizeof(Slot),
-               cudaMemcpyDeviceToHost);
-
-    std::printf("gpurhh::HashTable slots [%zu, %zu) "
-                "(capacity = %zu, bucket_size = %d):\n",
-                start, stop, capacity_, bucket_size);
-
-    constexpr std::size_t B = static_cast<std::size_t>(bucket_size);
-    std::size_t current_bucket = static_cast<std::size_t>(-1);
-    for (std::size_t i = 0; i < n; ++i) {
-        const std::size_t slot_idx   = start + i;
-        const std::size_t bucket_idx = slot_idx / B;
-        if (bucket_idx != current_bucket) {
-            std::printf("  bucket %zu:\n", bucket_idx);
-            current_bucket = bucket_idx;
-        }
-
-        const Slot& slot = host_slots[i];
-        std::printf("    slot %zu: ", slot_idx);
-        if (slot.key == empty_key) {
-            std::printf("empty\n");
-        } else if constexpr (sizeof(K) == 4 && sizeof(V) == 4) {
-            std::printf("key=0x%08x value=0x%08x\n",
-                        static_cast<unsigned int>(slot.key),
-                        static_cast<unsigned int>(slot.value));
-        } else {
-            std::printf("key=0x%016llx value=0x%016llx\n",
-                        static_cast<unsigned long long>(slot.key),
-                        static_cast<unsigned long long>(slot.value));
-        }
-    }
 }
 
 template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>

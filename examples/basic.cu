@@ -5,7 +5,13 @@
 // them back up, prints the round-trip, and finally pretty-prints the
 // table's memory layout.
 
+// Pull in the diagnostic pretty-printer at the end of the round-trip. It
+// touches the table's internal bucket array, so we opt into the gated
+// data() accessor before including any gpurhh header.
+#define GPURHH_ENABLE_INTERNAL_ACCESS 1
+
 #include <gpurhh/hash_table.cuh>
+#include <gpurhh/print.cuh>
 
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
@@ -94,7 +100,7 @@ int main() {
     std::printf("\n");
 
     // Dump the whole table.
-    table.print_slots(0, table.capacity());
+    gpurhh::print_slots(table, 0, table.capacity());
 
     cudaFree(d_keys);
     cudaFree(d_values);

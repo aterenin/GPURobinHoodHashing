@@ -272,10 +272,6 @@ public:
     // never less than `bucket_size`.
     std::size_t capacity() const noexcept;
 
-    // Diagnostic: pretty-print a slot range to stdout. Bucket boundaries
-    // are shown; empty slots are labeled "empty".
-    void print_slots(std::size_t start, std::size_t stop) const;
-
 #ifdef GPURHH_ENABLE_INTERNAL_ACCESS
     // Direct pointer access to the device-resident bucket array. Gated
     // behind a macro so users must opt in explicitly; the test suite does.
@@ -283,6 +279,14 @@ public:
     const Bucket* data() const noexcept;
 #endif
 };
+
+// Diagnostic helper. Lives in <gpurhh/print.cuh>, a separate header so
+// the core library stays independent of <cstdio> and <vector>. Relies
+// on HashTable::data(), so the including translation unit must define
+// GPURHH_ENABLE_INTERNAL_ACCESS first; <gpurhh/print.cuh> #errors
+// otherwise.
+template <class Table>
+void print_slots(const Table& table, std::size_t start, std::size_t stop);
 
 }  // namespace gpurhh
 ```
