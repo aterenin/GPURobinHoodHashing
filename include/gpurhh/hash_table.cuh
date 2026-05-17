@@ -276,15 +276,35 @@ public:
         // and it is the victim that is now unreachable. Callers that need
         // to avoid data loss should buffer the returned Slot and retry it
         // elsewhere (typically by rebuilding a larger table).
+        //
+        // When GPURHH_BENCHMARK_COUNTERS is defined, takes an additional
+        // trailing reference parameter `tile_counter`. Lane 0 of the tile
+        // increments it once per bucket read (i.e. once per probe loop
+        // iteration, including CAS-retry re-reads of the same bucket).
+        // The caller is expected to pass a per-tile register accumulator
+        // and flush it to a per-tile global slot at end of kernel — no
+        // atomic is involved in the increment.
         template <class Tile>
         __device__ cuda::std::optional<Slot> insert(
-            const Tile& tile, Key key, Value value);
+            const Tile& tile, Key key, Value value
+#ifdef GPURHH_BENCHMARK_COUNTERS
+            , std::uint32_t& tile_counter
+#endif
+        );
 
         // Cooperative single-key lookup. Returns the stored value if the
         // key is present, or an empty optional otherwise. Every lane in the
         // tile receives the same result.
+        //
+        // The `tile_counter` parameter under GPURHH_BENCHMARK_COUNTERS
+        // behaves the same way as in `insert`.
         template <class Tile>
-        __device__ cuda::std::optional<Value> get(const Tile& tile, Key key) const;
+        __device__ cuda::std::optional<Value> get(
+            const Tile& tile, Key key
+#ifdef GPURHH_BENCHMARK_COUNTERS
+            , std::uint32_t& tile_counter
+#endif
+        ) const;
 
         __host__ __device__ std::size_t capacity() const noexcept { return capacity_; }
 
@@ -415,7 +435,11 @@ HashTable<K, V, H, E, R, CL, WS, MPB>::view() const noexcept {
 template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
 template <class Tile>
 __device__ auto HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
-    const Tile& tile, K key, V value)
+    const Tile& tile, K key, V value
+#ifdef GPURHH_BENCHMARK_COUNTERS
+    , std::uint32_t& tile_counter
+#endif
+)
     -> cuda::std::optional<Slot>
 {
     // Bucketed Robin Hood insertion with lock-free CAS. The tile carries an
@@ -438,6 +462,13 @@ __device__ auto HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
 
     while (probe < probe_bound) {
         const std::size_t bucket_idx = (cur_home + probe) & bucket_mask;
+
+#ifdef GPURHH_BENCHMARK_COUNTERS
+        // Count one bucket-load per probe iteration. CAS-retry `continue`s
+        // re-enter the loop and re-read the same bucket — those count too,
+        // because they are real DRAM transactions.
+        if (tile.thread_rank() == 0) ++tile_counter;
+#endif
 
         // Cooperative load: one coalesced cache-line transaction. Each
         // lane reads one slot of the bucket (lane i reads slots[i]).
@@ -520,7 +551,12 @@ __device__ auto HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
 template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
 template <class Tile>
 __device__ cuda::std::optional<V>
-HashTable<K, V, H, E, R, CL, WS, MPB>::View::get(const Tile& tile, K key) const
+HashTable<K, V, H, E, R, CL, WS, MPB>::View::get(
+    const Tile& tile, K key
+#ifdef GPURHH_BENCHMARK_COUNTERS
+    , std::uint32_t& tile_counter
+#endif
+) const
 {
     // Bucket-level Robin Hood lookup. Probe home_bucket, then home_bucket+1,
     // etc., wrapping modulo num_buckets. Each iteration is one coalesced
@@ -541,6 +577,11 @@ HashTable<K, V, H, E, R, CL, WS, MPB>::View::get(const Tile& tile, K key) const
 
     for (std::size_t probe = 0; probe < probe_bound; ++probe) {
         const std::size_t bucket_idx = (home_bucket + probe) & bucket_mask;
+
+#ifdef GPURHH_BENCHMARK_COUNTERS
+        // One bucket-load per probe iteration.
+        if (tile.thread_rank() == 0) ++tile_counter;
+#endif
 
         // Each lane reads one slot — one coalesced cache-line transaction
         // for the whole tile.
