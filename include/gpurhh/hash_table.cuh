@@ -77,7 +77,7 @@ static_assert(default_empty_key<std::uint64_t>::key == 0xFFFFFFFFFFFFFFFFull);
 
 namespace detail {
 
-__device__ inline std::uint32_t fmix32(std::uint32_t h) noexcept {
+__host__ __device__ inline std::uint32_t fmix32(std::uint32_t h) noexcept {
     h ^= h >> 16;
     h *= 0x85ebca6bu;
     h ^= h >> 13;
@@ -86,7 +86,7 @@ __device__ inline std::uint32_t fmix32(std::uint32_t h) noexcept {
     return h;
 }
 
-__device__ inline std::uint64_t fmix64(std::uint64_t k) noexcept {
+__host__ __device__ inline std::uint64_t fmix64(std::uint64_t k) noexcept {
     k ^= k >> 33;
     k *= 0xff51afd7ed558ccdULL;
     k ^= k >> 33;

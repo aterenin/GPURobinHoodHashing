@@ -27,7 +27,7 @@ constexpr std::size_t kCapacity = 64;
 // slot 0 — the first empty lane — not at slot 5.
 void test_insert_single_key_into_empty_table() {
     TestTable table(kCapacity);
-    do_insert(table, {5}, {50});
+    run_insert(table, {5}, {50});
     auto state = read_state(table);
 
     assert(state[0].key == 5);
@@ -41,7 +41,7 @@ void test_insert_single_key_into_empty_table() {
 // (A) keys with distinct home buckets all land at their home slots.
 void test_insert_keys_into_distinct_home_buckets() {
     TestTable table(kCapacity);
-    do_insert(table, {0, 16, 32, 48}, {100, 200, 300, 400});
+    run_insert(table, {0, 16, 32, 48}, {100, 200, 300, 400});
     auto state = read_state(table);
 
     assert(state[0].key  ==  0 && state[0].value  == 100);
@@ -62,7 +62,7 @@ void test_insert_fills_home_bucket() {
         keys[i]   = static_cast<std::uint32_t>(i);
         values[i] = static_cast<std::uint32_t>(i * 10);
     }
-    do_insert(table, keys, values);
+    run_insert(table, keys, values);
     auto state = read_state(table);
 
     std::vector<bool> seen(16, false);
@@ -98,7 +98,7 @@ void test_insert_displaces_richer_resident() {
     }
     set_state(table, state);
 
-    do_insert(table, {64}, {640});
+    run_insert(table, {64}, {640});
     auto after = read_state(table);
 
     // Key 64 displaced key 16 at slot 16.
@@ -141,7 +141,7 @@ void test_insert_near_full() {
         keys[i]   = static_cast<std::uint32_t>(i + 1);
         values[i] = static_cast<std::uint32_t>(i * 7);
     }
-    do_insert(table, keys, values);
+    run_insert(table, keys, values);
     auto state = read_state(table);
 
     std::vector<std::uint32_t> keys_seen;
@@ -170,7 +170,7 @@ void test_insert_past_probe_cap_fails() {
         keys.push_back(i * 64);  // all multiples of 64 → home bucket 0
         values.push_back(i);
     }
-    const auto outcomes = do_insert_with_outcomes(table, keys, values);
+    const auto outcomes = run_insert_with_outcomes(table, keys, values);
     for (int o : outcomes) assert(o == 0);
 
     {
@@ -191,7 +191,7 @@ void test_insert_past_probe_cap_fails() {
     // resident (all residents have probe distance equal to ours), and
     // return false.
     const std::uint32_t over_cap_key = 64 * 64;  // 4096, also home bucket 0
-    const auto failed = do_insert_with_outcomes(table, {over_cap_key}, {999});
+    const auto failed = run_insert_with_outcomes(table, {over_cap_key}, {999});
     assert(failed.size() == 1);
     assert(failed[0] == 1);
 
@@ -226,7 +226,7 @@ void test_concurrent_same_key_inserts() {
     for (std::size_t i = 0; i < N; ++i) {
         values[i] = static_cast<std::uint32_t>(i + 1);
     }
-    do_insert(table, keys, values);
+    run_insert(table, keys, values);
 
     const auto state = read_state(table);
 
@@ -267,7 +267,7 @@ void test_insert_wraps_around() {
     // probe residents → no displacement, advance) and then land at bucket
     // 0 lane 0 via the modular wrap.
     const std::uint32_t wrapped_key = 48u + 64u;  // 112; home bucket 3
-    do_insert(table, {wrapped_key}, {1120u});
+    run_insert(table, {wrapped_key}, {1120u});
     const auto after = read_state(table);
 
     // The new key landed at slot 0.

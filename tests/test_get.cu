@@ -19,7 +19,7 @@ void test_hit_in_home_bucket() {
     state[5] = {5, 50};
     set_state(table, state);
 
-    auto r = get_one(table, 5);
+    auto r = run_get_one(table, 5);
     assert(r.has_value());
     assert(*r == 50);
 }
@@ -38,7 +38,7 @@ void test_hit_in_second_bucket() {
     state[TestTable::bucket_size] = {64, 6400};  // slot 16 = bucket 1, lane 0
     set_state(table, state);
 
-    auto r = get_one(table, 64);
+    auto r = run_get_one(table, 64);
     assert(r.has_value());
     assert(*r == 6400);
 }
@@ -47,7 +47,7 @@ void test_miss_in_empty_table() {
     TestTable table(kCapacity);
     set_state(table, empty_state(table));
 
-    auto r = get_one(table, 42);
+    auto r = run_get_one(table, 42);
     assert(!r.has_value());
 }
 
@@ -62,7 +62,7 @@ void test_miss_via_empty_slot_in_home_bucket() {
     state[1] = {1, 101};
     set_state(table, state);
 
-    auto r = get_one(table, 5);
+    auto r = run_get_one(table, 5);
     assert(!r.has_value());
 }
 
@@ -84,7 +84,7 @@ void test_miss_via_richer_resident() {
     }
     set_state(table, state);
 
-    auto r = get_one(table, 64);
+    auto r = run_get_one(table, 64);
     assert(!r.has_value());
 }
 
@@ -114,7 +114,7 @@ void test_get_at_various_probe_distances() {
     for (std::size_t bucket = 0; bucket < kCapacity / B; ++bucket) {
         const std::size_t slot_idx = bucket * B;
         const std::uint32_t key = static_cast<std::uint32_t>(slot_idx * 64);
-        const auto r = get_one(table, key);
+        const auto r = run_get_one(table, key);
         assert(r.has_value());
         assert(*r == slot_idx);
     }
@@ -142,14 +142,14 @@ void test_get_with_wrapped_probe() {
     state[0] = {wrapped_key, 1120u};
     set_state(table, state);
 
-    auto r = get_one(table, wrapped_key);
+    auto r = run_get_one(table, wrapped_key);
     assert(r.has_value());
     assert(*r == 1120u);
 
     // Sanity: the original home-3 residents are still findable.
-    auto r48 = get_one(table, 48);
+    auto r48 = run_get_one(table, 48);
     assert(r48.has_value() && *r48 == 480u);
-    auto r63 = get_one(table, 63);
+    auto r63 = run_get_one(table, 63);
     assert(r63.has_value() && *r63 == 630u);
 }
 

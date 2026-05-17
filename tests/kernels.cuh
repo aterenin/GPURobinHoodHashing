@@ -34,7 +34,7 @@ static_assert(kBlockSize % Table::tile_size == 0,
 // pair. Tiles are tile-strided across the grid so batches larger than the
 // grid still work.
 
-__global__ void insert_kernel(View view,
+__global__ void insert(View view,
                                      const std::uint32_t* keys,
                                      const std::uint32_t* values,
                                      std::size_t n)
@@ -55,7 +55,7 @@ __global__ void insert_kernel(View view,
 // For each input key, writes (value, 1) on hit and (_, 0) on miss.
 // view.get returns the same cuda::std::optional<Value> on every lane in the
 // tile; lane 0 performs the store to keep the store count to one per key.
-__global__ void get_kernel(View view,
+__global__ void get(View view,
                                   const std::uint32_t* keys,
                                   std::uint32_t* values_out,
                                   int* found_out,
@@ -96,7 +96,7 @@ inline void bulk_insert(Table& table,
     const int tiles_per_block = kBlockSize / Table::tile_size;
     const int grid_size =
         static_cast<int>((n + tiles_per_block - 1) / tiles_per_block);
-    insert_kernel<<<grid_size, kBlockSize>>>(table.view(), d_keys, d_values, n);
+    insert<<<grid_size, kBlockSize>>>(table.view(), d_keys, d_values, n);
     cudaGetLastError()      >> CUDA_CHECK;
     cudaDeviceSynchronize() >> CUDA_CHECK;
 
@@ -121,7 +121,7 @@ inline void bulk_get(Table& table,
     const int tiles_per_block = kBlockSize / Table::tile_size;
     const int grid_size =
         static_cast<int>((n + tiles_per_block - 1) / tiles_per_block);
-    get_kernel<<<grid_size, kBlockSize>>>(
+    get<<<grid_size, kBlockSize>>>(
         table.view(), d_keys, d_values_out, d_found_out, n);
     cudaGetLastError()      >> CUDA_CHECK;
     cudaDeviceSynchronize() >> CUDA_CHECK;

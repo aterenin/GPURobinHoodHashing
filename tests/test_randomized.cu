@@ -75,7 +75,7 @@ void run_uniform(std::size_t capacity, double load_factor, std::uint32_t seed) {
         ++i;
     }
 
-    do_insert(table, keys, values);
+    run_insert(table, keys, values);
     const auto state = read_state(table);
     verify_uniform_state(state, N);
     assert_robin_hood_invariant(table, state);
@@ -134,7 +134,7 @@ void run_sum_reduction(std::size_t capacity,
         expected_sums[k] += v;
     }
 
-    do_insert(table, keys, values);
+    run_insert(table, keys, values);
     const auto state = read_state(table);
 
     // Every occupied slot's value must equal the host-computed sum for

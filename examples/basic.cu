@@ -26,7 +26,7 @@ using View  = Table::View;
 
 // One tile per (key, value) pair; the block size is sized so each tile
 // has exactly one input to process.
-__global__ void insert_kernel(View view,
+__global__ void insert(View view,
                               const std::uint32_t* keys,
                               const std::uint32_t* values,
                               std::size_t n)
@@ -40,7 +40,7 @@ __global__ void insert_kernel(View view,
 }
 
 // Same shape as the insert kernel: one tile per query.
-__global__ void get_kernel(View view,
+__global__ void get(View view,
                            const std::uint32_t* keys,
                            std::uint32_t* values_out,
                            int* found_out,
@@ -76,7 +76,7 @@ int main() {
     // Launch one block, N tiles. tile_size is 16 for our default
     // (uint32, uint32) instantiation, so block size = N * 16 = 64 threads.
     const int block_size = static_cast<int>(N * Table::tile_size);
-    insert_kernel<<<1, block_size>>>(table.view(), d_keys, d_values, N);
+    insert<<<1, block_size>>>(table.view(), d_keys, d_values, N);
     cudaDeviceSynchronize();
 
     // Read the inserted pairs back.
@@ -84,7 +84,7 @@ int main() {
     int*           d_found_out  = nullptr;
     cudaMalloc(&d_values_out, N * sizeof(std::uint32_t));
     cudaMalloc(&d_found_out,  N * sizeof(int));
-    get_kernel<<<1, block_size>>>(table.view(), d_keys, d_values_out, d_found_out, N);
+    get<<<1, block_size>>>(table.view(), d_keys, d_values_out, d_found_out, N);
     cudaDeviceSynchronize();
 
     std::uint32_t h_values_out[N];

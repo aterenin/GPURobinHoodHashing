@@ -12,7 +12,7 @@
 //   - set_state / read_state — direct cudaMemcpy into / out of the table's
 //     internal bucket array (requires GPURHH_ENABLE_INTERNAL_ACCESS, set
 //     by tests.cuh).
-//   - insert_many_kernel / do_insert — tile-strided insert and host-side
+//   - insert_many / run_insert — tile-strided insert and host-side
 //     launcher.
 //   - assert_robin_hood_invariant — structural check usable as a safety
 //     net after any sequence of inserts.
@@ -77,7 +77,7 @@ inline std::vector<typename Table::Slot> read_state(const Table& table) {
 
 // Insert kernel: one tile per (key, value) pair, tile-strided over n.
 template <class Table>
-__global__ void insert_many_kernel(typename Table::View view,
+__global__ void insert_many(typename Table::View view,
                                    const typename Table::key_type* keys,
                                    const typename Table::value_type* values,
                                    std::size_t n) {
@@ -94,7 +94,7 @@ __global__ void insert_many_kernel(typename Table::View view,
 
 // Host-side bulk insert helper.
 template <class Table>
-inline void do_insert(Table& table,
+inline void run_insert(Table& table,
                       const std::vector<typename Table::key_type>& keys,
                       const std::vector<typename Table::value_type>& values) {
     using Key   = typename Table::key_type;
@@ -116,7 +116,7 @@ inline void do_insert(Table& table,
     const int tiles_per_block = block_size / Table::tile_size;
     const int grid_size =
         static_cast<int>((keys.size() + tiles_per_block - 1) / tiles_per_block);
-    insert_many_kernel<Table><<<grid_size, block_size>>>(
+    insert_many<Table><<<grid_size, block_size>>>(
         table.view(), d_keys, d_values, keys.size());
     cudaGetLastError()      >> CUDA_CHECK;
     cudaDeviceSynchronize() >> CUDA_CHECK;
@@ -128,7 +128,7 @@ inline void do_insert(Table& table,
 // Insert kernel that captures per-key success/failure. `outcomes[i]` is set
 // to 0 if the i-th insert succeeded, 1 if it returned false (probe cap hit).
 template <class Table>
-__global__ void insert_many_with_outcomes_kernel(
+__global__ void insert_many_with_outcomes(
     typename Table::View view,
     const typename Table::key_type* keys,
     const typename Table::value_type* values,
@@ -152,7 +152,7 @@ __global__ void insert_many_with_outcomes_kernel(
 // Host-side bulk-insert helper that captures each insert's return value as
 // a per-key outcome (0 = succeeded, 1 = probe cap hit / failed).
 template <class Table>
-inline std::vector<int> do_insert_with_outcomes(
+inline std::vector<int> run_insert_with_outcomes(
     Table& table,
     const std::vector<typename Table::key_type>& keys,
     const std::vector<typename Table::value_type>& values)
@@ -179,7 +179,7 @@ inline std::vector<int> do_insert_with_outcomes(
     const int tiles_per_block = block_size / Table::tile_size;
     const int grid_size =
         static_cast<int>((keys.size() + tiles_per_block - 1) / tiles_per_block);
-    insert_many_with_outcomes_kernel<Table><<<grid_size, block_size>>>(
+    insert_many_with_outcomes<Table><<<grid_size, block_size>>>(
         table.view(), d_keys, d_values, d_outcomes, keys.size());
     cudaGetLastError()      >> CUDA_CHECK;
     cudaDeviceSynchronize() >> CUDA_CHECK;
@@ -195,7 +195,7 @@ inline std::vector<int> do_insert_with_outcomes(
 
 // Single-tile get kernel: one block, one tile, looks up one key.
 template <class Table>
-__global__ void get_one_kernel(typename Table::View view,
+__global__ void get_one(typename Table::View view,
                                typename Table::key_type key,
                                typename Table::value_type* value_out,
                                int* found_out)
@@ -212,7 +212,7 @@ __global__ void get_one_kernel(typename Table::View view,
 // Host-side single-key get returning an optional value.
 template <class Table>
 inline std::optional<typename Table::value_type>
-get_one(Table& table, typename Table::key_type key)
+run_get_one(Table& table, typename Table::key_type key)
 {
     using Value = typename Table::value_type;
     Value* d_value = nullptr;
@@ -220,7 +220,7 @@ get_one(Table& table, typename Table::key_type key)
     cudaMalloc(&d_value, sizeof(Value)) >> CUDA_CHECK;
     cudaMalloc(&d_found, sizeof(int))   >> CUDA_CHECK;
 
-    get_one_kernel<Table><<<1, Table::tile_size>>>(
+    get_one<Table><<<1, Table::tile_size>>>(
         table.view(), key, d_value, d_found);
     cudaGetLastError()      >> CUDA_CHECK;
     cudaDeviceSynchronize() >> CUDA_CHECK;
@@ -237,7 +237,7 @@ get_one(Table& table, typename Table::key_type key)
 
 // Bulk get kernel: one tile per key, tile-strided.
 template <class Table>
-__global__ void get_many_kernel(typename Table::View view,
+__global__ void get_many(typename Table::View view,
                                 const typename Table::key_type* keys,
                                 typename Table::value_type* values_out,
                                 int* found_out,
@@ -260,7 +260,7 @@ __global__ void get_many_kernel(typename Table::View view,
 
 // Host-side bulk get. Resizes `values_out` and `found_out` to match keys.
 template <class Table>
-inline void do_get(Table& table,
+inline void run_get(Table& table,
                    const std::vector<typename Table::key_type>& keys,
                    std::vector<typename Table::value_type>& values_out,
                    std::vector<int>& found_out)
@@ -285,7 +285,7 @@ inline void do_get(Table& table,
     const int tiles_per_block = block_size / Table::tile_size;
     const int grid_size =
         static_cast<int>((keys.size() + tiles_per_block - 1) / tiles_per_block);
-    get_many_kernel<Table><<<grid_size, block_size>>>(
+    get_many<Table><<<grid_size, block_size>>>(
         table.view(), d_keys, d_values, d_found, keys.size());
     cudaGetLastError()      >> CUDA_CHECK;
     cudaDeviceSynchronize() >> CUDA_CHECK;

@@ -42,7 +42,7 @@ void test_adversarial_parallel_displacement() {
         keys[i]   = static_cast<std::uint32_t>(256 + i);
         values[i] = static_cast<std::uint32_t>(100000 + i);
     }
-    const auto outcomes = do_insert_with_outcomes(table, keys, values);
+    const auto outcomes = run_insert_with_outcomes(table, keys, values);
     for (int o : outcomes) assert(o == 0);
 
     const auto after = read_state(table);
@@ -65,7 +65,7 @@ void test_adversarial_parallel_displacement() {
 
     std::vector<std::uint32_t> got_values;
     std::vector<int> got_found;
-    do_get(table, all_keys, got_values, got_found);
+    run_get(table, all_keys, got_values, got_found);
     for (std::size_t i = 0; i < all_keys.size(); ++i) {
         assert(got_found[i] == 1);
     }
@@ -96,11 +96,11 @@ void test_concurrent_gets() {
         keys[i]   = static_cast<std::uint32_t>(i + 1);
         values[i] = static_cast<std::uint32_t>((i + 1) * 7u);
     }
-    do_insert(table, keys, values);
+    run_insert(table, keys, values);
 
     std::vector<std::uint32_t> got_values;
     std::vector<int> got_found;
-    do_get(table, keys, got_values, got_found);
+    run_get(table, keys, got_values, got_found);
 
     for (std::size_t i = 0; i < N; ++i) {
         assert(got_found[i] == 1);
@@ -128,7 +128,7 @@ void test_mixed_new_and_duplicate_inserts() {
         keys.push_back(k); values.push_back(k * 10u);
         keys.push_back(k); values.push_back(k * 100u);
     }
-    do_insert(table, keys, values);
+    run_insert(table, keys, values);
 
     // For each unique key, get returns one of the two inserted values.
     std::vector<std::uint32_t> unique_keys(U);
@@ -136,7 +136,7 @@ void test_mixed_new_and_duplicate_inserts() {
 
     std::vector<std::uint32_t> got_values;
     std::vector<int> got_found;
-    do_get(table, unique_keys, got_values, got_found);
+    run_get(table, unique_keys, got_values, got_found);
     for (std::size_t i = 0; i < U; ++i) {
         assert(got_found[i] == 1);
         const std::uint32_t k = unique_keys[i];
@@ -173,7 +173,7 @@ void test_parallel_probe_cap_saturation() {
         keys[i]   = static_cast<std::uint32_t>(i * 64);
         values[i] = static_cast<std::uint32_t>(i);
     }
-    const auto outcomes = do_insert_with_outcomes(table, keys, values);
+    const auto outcomes = run_insert_with_outcomes(table, keys, values);
 
     std::size_t succeeded = 0, failed = 0;
     for (int o : outcomes) {
@@ -201,7 +201,7 @@ void test_parallel_probe_cap_saturation() {
     std::vector<std::uint32_t> survivors_vec(surviving.begin(), surviving.end());
     std::vector<std::uint32_t> got_values;
     std::vector<int> got_found;
-    do_get(table, survivors_vec, got_values, got_found);
+    run_get(table, survivors_vec, got_values, got_found);
     for (std::size_t i = 0; i < survivors_vec.size(); ++i) {
         assert(got_found[i] == 1);
     }
