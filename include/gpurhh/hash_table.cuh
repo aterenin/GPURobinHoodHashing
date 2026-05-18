@@ -331,7 +331,9 @@ public:
 
     // Allocates a slot array on the current device sized for at least
     // `min_capacity` slots, rounded up to the next power of two, and
-    // initializes every slot to (empty_key, _).
+    // initializes every slot to (empty_key, _). Synchronous: cudaMalloc
+    // already blocks the host, so there is nothing to be gained from
+    // routing the slot-init memset through a stream.
     explicit HashTable(std::size_t min_capacity);
 
     ~HashTable();

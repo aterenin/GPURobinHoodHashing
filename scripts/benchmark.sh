@@ -3,9 +3,10 @@
 # Run the full gpurhh benchmark sweep.
 #
 # Writes per-workload CSV files (memcpy.csv, insert.csv, get.csv) plus
-# a run_info.txt sidecar with environment metadata to the output dir.
-# The output dir defaults to output/ under the repo root; override by
-# passing a path as the first argument.
+# a run_info.txt sidecar with environment metadata and a benchmark.log
+# transcript to the output dir. The output dir defaults to
+# output/<timestamp>/ under the repo root, so consecutive runs don't
+# collide; override by passing a path as the first argument.
 #
 # Expects the benchmark binaries to be built at $REPO_ROOT/build/benchmarks/.
 # Run `make benchmarks` first; or `make benchmark` to build and sweep in
@@ -16,13 +17,21 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/build/benchmarks"
 
-# Output dir: optional positional arg, else `output/` under the repo root.
+# Output dir: optional positional arg, else a fresh timestamped dir
+# under output/. Date-then-time, sortable, no colons (which would be
+# annoying inside paths).
 if [[ $# -ge 1 ]]; then
     OUTPUT_DIR="$1"
 else
-    OUTPUT_DIR="${REPO_ROOT}/output"
+    OUTPUT_DIR="${REPO_ROOT}/output/$(date +%Y-%m-%d_%H-%M-%S)"
 fi
 mkdir -p "${OUTPUT_DIR}"
+
+# Mirror everything we print from here on to a log file in the output
+# dir, so the run is reproducible from disk afterwards. `tee -a` appends,
+# matching the CSV writer's behavior across reruns into the same dir.
+LOG_FILE="${OUTPUT_DIR}/benchmark.log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 # Make sure the binaries are built.
 for bin in benchmark_memcpy benchmark_insert benchmark_get; do
