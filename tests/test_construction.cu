@@ -2,6 +2,8 @@
 
 #include "kernels.cuh"
 
+#include <vector>
+
 namespace {
 
 void test_construct_with_capacity() {
@@ -72,6 +74,30 @@ void test_capacity_below_bucket_size_clamps() {
     assert(table.capacity() == Table::bucket_size);
 }
 
+// Seed the bucket array with a non-default byte pattern via the
+// data() back door, call clear, and confirm every byte is back to
+// empty_key_byte. Bypasses insert/get to test clear in isolation.
+void test_clear_resets_table() {
+    Table table(64);
+    const std::size_t bytes = (table.capacity() / Table::bucket_size)
+                              * sizeof(Table::Bucket);
+
+    // 0xAA differs from empty_key_byte (0xFF for unsigned keys), so a
+    // successful clear must overwrite every byte.
+    cudaMemset(table.data(), 0xAA, bytes) >> CUDA_CHECK;
+    cudaDeviceSynchronize()                >> CUDA_CHECK;
+
+    table.clear();
+    cudaDeviceSynchronize() >> CUDA_CHECK;
+
+    std::vector<unsigned char> host(bytes);
+    cudaMemcpy(host.data(), table.data(), bytes,
+               cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+    for (std::size_t i = 0; i < bytes; ++i) {
+        assert(host[i] == Table::empty_key_byte);
+    }
+}
+
 // (E5) Get on a moved-from (capacity-zero) table returns not-found
 // without crashing — View::get's probe loop bound is 0 so the body never
 // executes.
@@ -108,6 +134,7 @@ int main() {
     test_move_assignment();
     test_minimum_size_table();
     test_capacity_below_bucket_size_clamps();
+    test_clear_resets_table();
     test_get_on_moved_from_table_returns_not_found();
     std::printf("test_construction: all tests passed.\n");
     return 0;

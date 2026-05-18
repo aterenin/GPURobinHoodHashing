@@ -144,6 +144,13 @@ struct sum_op {
     }
 };
 
+// Named constant for the CUDA runtime's default stream, used as the
+// default argument for host-side methods that issue async work. Stream
+// 0 is the legacy/default stream, equivalent to nullptr for the
+// `cudaStream_t` pointer type; the named alias makes call sites
+// self-documenting at the declaration of e.g. `clear`.
+inline constexpr cudaStream_t default_stream = 0;
+
 // -----------------------------------------------------------------------------
 // HashTable: host-side owner of the device-resident slot array.
 // -----------------------------------------------------------------------------
@@ -340,6 +347,12 @@ public:
     // Actual capacity (input capacity rounded up to a power of two).
     std::size_t capacity() const noexcept { return capacity_; }
 
+    // Empty the table — every slot is reset to (empty_key, _). Async on
+    // the given CUDA stream; the caller is responsible for synchronizing
+    // before launching anything that depends on the cleared state.
+    // `default_stream` (= 0) selects the runtime's default stream.
+    void clear(cudaStream_t stream = default_stream);
+
 #ifdef GPURHH_ENABLE_INTERNAL_ACCESS
     // Direct access to the underlying device-resident bucket array, of
     // length `capacity() / bucket_size`. Only available when the including
@@ -430,6 +443,13 @@ HashTable<K, V, H, E, R, CL, WS, MPB>::view() const noexcept {
     // v.hash_ and v.reduce_ are default-constructed by View's in-class
     // default initializers.
     return v;
+}
+
+template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
+void HashTable<K, V, H, E, R, CL, WS, MPB>::clear(cudaStream_t stream) {
+    const std::size_t num_buckets = capacity_ / bucket_size;
+    cudaMemsetAsync(buckets_, empty_key_byte,
+                    num_buckets * sizeof(Bucket), stream);
 }
 
 template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
