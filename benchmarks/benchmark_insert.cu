@@ -12,13 +12,6 @@
 //   3. Time one kernel that processes n_ops insert ops in a grid-stride loop.
 //   4. Sum per-tile counters on host; write a CSV row.
 
-// Opt in to the gpurhh benchmark counter API and the internal data()
-// accessor (needed to memset the bucket array between reps without
-// destroying / reconstructing the table). Both macros must be defined
-// before any gpurhh header inclusion.
-#define GPURHH_BENCHMARK_COUNTERS    1
-#define GPURHH_ENABLE_INTERNAL_ACCESS 1
-
 #include "benchmarks.cuh"
 
 #include <cooperative_groups.h>
@@ -241,9 +234,7 @@ int main(int argc, char** argv) {
     EventTimer timer;
 
     auto reset_table = [&]() {
-        const std::size_t num_buckets = capacity / Table::bucket_size;
-        cudaMemset(table.data(), 0xFF,
-                   num_buckets * sizeof(Table::Bucket)) >> CUDA_CHECK;
+        table.clear();
     };
     auto reset_counters = [&]() {
         cudaMemset(d_probes,   0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;

@@ -5,6 +5,11 @@
 // Independent of the test suite — benchmarks should not pull in
 // <tests/...>.
 
+// Opt every benchmark TU into the gpurhh probe-counter API. Defined
+// before any gpurhh include so that View::insert / View::get expose
+// their counter parameters. See notes/design.md for the contract.
+#define GPURHH_BENCHMARK_COUNTERS 1
+
 #include <gpurhh/hash_table.cuh>
 
 #include <cuda_runtime.h>

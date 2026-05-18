@@ -18,8 +18,6 @@
 //   4. Timed reps: zero counters → time get kernel → sum per-tile
 //      counters on host → write CSV row.
 
-#define GPURHH_BENCHMARK_COUNTERS 1
-
 #include "benchmarks.cuh"
 
 #include <cooperative_groups.h>
