@@ -138,6 +138,7 @@ The bandwidth strategy follows from this:
   Exposed as a `MaxProbeBuckets` template parameter (default 8).
   An insert that would place a key past the cap fails (the caller is expected to rehash); a get that probes the cap without finding the key returns "not found" (correct because of the insert-side cap).
   With Robin Hood at load factor ~0.85 and `bucket_size` 16, the expected longest probe is well under the default cap; the cap protects against adversarial inputs and very high load factors.
+  Empirically, on uniform-random keys with α=1, the default cap-8 budget handles input load factor F ≤ 2 (≈ 80% slot occupancy) with zero failures, and starts losing about 0.1% of inserts at F = 3 (≈ 95% occupancy) — a real but small number that callers can either tolerate, drop (cf. lossy-storage workloads), or recover by buffering the leftover Slots and replaying into a larger table.
   Crucially, a failing insert hands the leftover `(key, value)` back to the caller via the return value rather than dropping it on the floor.
   This matters because the leftover may not be the original input: if Robin Hood displacements happened during the probe, the originally-passed-in pair is already in the table and the leftover is the most-recently-evicted victim.
   Returning it is what makes the operation lossless under failure — callers can buffer leftovers and replay them into a rebuilt larger table.
@@ -243,6 +244,10 @@ Not supported. The natural design is backward-shift deletion, but a correct lock
 ```cpp
 namespace gpurhh {
 
+// Named alias for the CUDA runtime's default stream. Used as the
+// default argument for host-side methods that issue async work.
+inline constexpr cudaStream_t default_stream = 0;
+
 template <class Key,
           class Value,
           class Hash             = default_hash<Key>,
@@ -259,18 +264,38 @@ public:
     HashTable(HashTable&&) noexcept;
     HashTable& operator=(HashTable&&) noexcept;
 
+    // Empty the table — every slot reset to (empty_key, _). Async on
+    // the given stream; caller is responsible for synchronizing before
+    // any operation that depends on the cleared state.
+    void clear(cudaStream_t stream = default_stream);
+
     // Device-side handle. Trivially copyable; pass by value into kernels.
     class View {
     public:
-        template <class Tile>
         // Returns nullopt on success; on probe-cap failure returns the
         // leftover Slot that could not be placed (may be the original
         // pair, or a Robin Hood victim displaced before the failure).
+        //
+        // The `tile_counter` parameter appears only when
+        // GPURHH_BENCHMARK_COUNTERS is defined. Lane 0 of the tile
+        // increments it on each bucket-load; the caller is expected
+        // to pass a per-tile register accumulator and flush it to a
+        // per-tile global slot at end of kernel.
+        template <class Tile>
         __device__ cuda::std::optional<Slot>
-        insert(const Tile& tile, Key key, Value value);
+        insert(const Tile& tile, Key key, Value value
+#ifdef GPURHH_BENCHMARK_COUNTERS
+            , std::uint32_t& tile_counter
+#endif
+        );
 
         template <class Tile>
-        __device__ cuda::std::optional<Value> get(const Tile& tile, Key key) const;
+        __device__ cuda::std::optional<Value>
+        get(const Tile& tile, Key key
+#ifdef GPURHH_BENCHMARK_COUNTERS
+            , std::uint32_t& tile_counter
+#endif
+        ) const;
     };
 
     View view() const noexcept;
@@ -298,6 +323,13 @@ void print_slots(const Table& table, std::size_t start, std::size_t stop);
 }  // namespace gpurhh
 ```
 
+### Opt-in macros
+
+Two macros gate functionality that the core library doesn't expose by default. Both must be defined in the translation unit *before* any `<gpurhh/...>` header is included:
+
+- **`GPURHH_ENABLE_INTERNAL_ACCESS`** exposes `HashTable::data()`, giving direct pointer access to the device-resident bucket array. Used by `<gpurhh/print.cuh>` (which `#error`s if the macro is missing) and by the test suite's `set_state` / `read_state` helpers, which need to seed and inspect raw table layouts via `cudaMemcpy` to test corner cases in isolation.
+- **`GPURHH_BENCHMARK_COUNTERS`** adds a trailing `std::uint32_t& tile_counter` parameter to `View::insert` and `View::get`. Lane 0 of the tile increments it on every bucket-load (a CAS-retry re-read counts too — it's a real DRAM transaction). The caller maintains a per-tile register accumulator and writes it out once at end of kernel; no atomics are involved in the probing hot loop. The benchmark binaries enable this; tests and the example do not.
+
 The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers calls `view.insert(tile, ...)` or `view.get(tile, ...)` directly.
 Bulk host-side operations are deliberately *not* part of the table — callers manage their device buffers and write their own driver kernels.
 The tests in `tests/kernels.cuh` and `tests/isolated.cuh` show the canonical pattern; `examples/basic.cu` is a minimal standalone walkthrough.
@@ -306,7 +338,7 @@ The tests in `tests/kernels.cuh` and `tests/isolated.cuh` show the canonical pat
 
 The test suite lives in `tests/`, with each `test_*.cu` compiled into its own executable.
 
-- **`test_construction.cu`** — construct / destruct, move semantics, edge sizes (capacity == bucket_size, capacity below bucket_size), moved-from state behavior.
+- **`test_construction.cu`** — construct / destruct, move semantics, edge sizes (capacity == bucket_size, capacity below bucket_size), moved-from state behavior, and `clear()` returning the bucket array to the empty-byte pattern.
 - **`test_combined.cu`** — end-to-end insert + get round-trips through the public API.
 - **`test_get.cu`** — `View::get` in isolation. Pre-states are hand-built with `IdentityHash` so the probe sequence and home buckets are deterministic; the test then verifies `get`'s match / empty / richer-resident / wrap-around behavior.
 - **`test_insert.cu`** — `View::insert` in isolation. Some tests use hand-computed expected layouts; all run a Robin Hood invariant scanner over the final state as a safety net. Covers the probe-cap failure path and concurrent same-key inserts.
@@ -317,11 +349,44 @@ Three shared infrastructure headers:
 
 - **`tests/tests.cuh`** — the `CUDA_CHECK` postfix error-check operator (`expr >> CUDA_CHECK`) and the `GPURHH_ENABLE_INTERNAL_ACCESS` macro, which gates `HashTable::data()`.
 - **`tests/kernels.cuh`** — the `Table` alias (with `default_hash`), bulk insert/get host helpers, and end-to-end driver kernels. Used by the "combined" and construction tests.
-- **`tests/isolated.cuh`** — the `TestTable` alias (with `IdentityHash` for predictable home buckets), templated `do_insert` / `do_get` / `do_insert_with_outcomes`, the `assert_robin_hood_invariant` scanner, and `set_state` / `read_state` for direct table-memory manipulation via the `data()` back-door.
+- **`tests/isolated.cuh`** — the `TestTable` alias (with `IdentityHash` for predictable home buckets), templated `run_insert` / `run_get` / `run_get_one` / `run_insert_with_outcomes`, the `assert_robin_hood_invariant` scanner, and `set_state` / `read_state` for direct table-memory manipulation via the `data()` back-door.
 
 The `IdentityHash` is the enabling choice for the isolated tests: with `hash(K) = K`, the home bucket of a key is fully predictable from its value, so we can construct any valid Robin Hood state with one `cudaMemcpy` and hand-predict the outcome of small insert sequences. The randomized tests apply a bit-mixing function (the same `fmix32` finalizer used by `default_hash`) as a permutation on sequential integers — this gives distinct random-looking keys without the host-side dedup overhead that an `unordered_set` would require, which is what makes the gigabyte-scale tests fit in memory.
 
-The test suite runs about 34 tests across ~1100 lines of code, against ~350 lines of library code. The high ratio is deliberate: this is a concurrent data structure, and the failure modes for concurrent CAS retries, displacement chains, and probe-cap interactions are subtle enough that we put significant effort into checking each path.
+The test suite runs about 35 tests across ~1100 lines of code, against ~350 lines of library code. The high ratio is deliberate: this is a concurrent data structure, and the failure modes for concurrent CAS retries, displacement chains, and probe-cap interactions are subtle enough that we put significant effort into checking each path.
+
+## Benchmarking
+
+Throughput and bandwidth measurements live in `benchmarks/`, with the same one-binary-per-workload structure as the tests.
+Three executables:
+
+- **`benchmark_memcpy.cu`** — peak-bandwidth reference. Times `cudaMemcpyAsync(... D2D)` and a trivial `uint4`-vectorized copy kernel on a buffer of configurable size. Reports effective GB/s assuming two bytes of DRAM traffic per byte of payload (one read + one write). Not a workload we care about; just the achievable-peak number to normalize the hash-table results against.
+- **`benchmark_insert.cu`** — inserts `n_ops` keys into a freshly-cleared table per timed rep. Uses `sum_op` reduction, so repeated-key inserts accumulate instead of failing.
+- **`benchmark_get.cu`** — pre-fills the table once (untimed) with one stream of `Uniform(0, key_range)` keys, then times lookups against an independent stream drawn from the same distribution. The independence gives a natural hit rate ≈ effective occupancy without an explicit hit-rate knob. Pre-fill probe-cap failures at high F are recorded in the `prefill_failures` CSV column rather than treated as fatal; the get throughput numbers remain valid against the (slightly under-populated) actual table state, and the `hits` / `misses` columns reflect that state empirically.
+
+### Workload knobs
+
+- **`capacity`** is held at 1 GiB by default — well past the L2 cache on any sm_89 device, putting the kernel firmly in the DRAM-bound regime.
+- **`α = key_range / capacity`** is fixed at 1: keys are drawn from `Uniform(0, capacity)`, which gives the cleanest relationship between input load factor F and expected occupancy.
+- **`F = n_ops / capacity`** is the swept axis. The sweep grid is `F ∈ {0.5, 1.0, 1.5, 2.0, 3.0}`. At low F the table is mostly empty and Robin Hood barely engages; the interesting cliff is in F = 2.0–3.0 where occupancy approaches 0.9+ and probe distances grow.
+- **`block_size ∈ {64, 128, 256, 512, 1024}`** is swept to spot-check that launch shape doesn't dominate (it typically doesn't for bandwidth-bound kernels, but worth verifying once per workload).
+
+### Per-tile probe counters
+
+The `GPURHH_BENCHMARK_COUNTERS` macro adds a probe counter parameter to `View::insert` / `View::get`. The benchmark kernels accumulate per-thread register counters across a grid-stride loop and flush one value per tile to a global array at end of kernel; no atomics fire in the probe hot loop. The host sums per-tile values into a grand total per rep.
+
+This gives the benchmark *two* bandwidth numbers:
+
+- **`gbps_floor`** — `n_ops × sizeof(Bucket) / time`. Assumes exactly one bucket read per op. Lower bound on actual DRAM traffic.
+- **`gbps_corrected`** — `total_probes × sizeof(Bucket) / time`. Uses the measured probe count. Accurate to within the fraction of writes the floor estimate ignores (~3–6%; documented in the column header).
+
+At low F the two converge (avg probe length ≈ 1). At high F the corrected number diverges upward — that gap is itself a useful signal about how hard Robin Hood is working.
+
+### Sweep driver
+
+`scripts/benchmark.sh` runs the full grid (50 invocations for the gpurhh workloads + 1 memcpy reference) and writes one CSV per workload (`memcpy.csv`, `insert.csv`, `get.csv`) plus a `run_info.txt` sidecar with `nvcc --version`, `uname`, and `nvidia-smi`'s GPU name / driver version / memory size / power limit. Default output dir is `output/` under the repo root; can be overridden by passing a path as the first argument.
+
+`make benchmark` builds the binaries at `-O3` (the default for the benchmark pattern rule; see Makefile) and then invokes the sweep script. Numbers from unoptimized builds are meaningless, so the `-O3` default is non-overridable in practice.
 
 ## Known limitations
 
@@ -334,7 +399,7 @@ The test suite runs about 34 tests across ~1100 lines of code, against ~350 line
 ## Out of scope
 
 - **Non-NVIDIA backends.** The abstractions (`CacheLineBytes` and `WarpSize` as table-level template parameters) don't preclude AMD support, but we haven't written or tested it. The same algorithm with AMD's 64-byte cache line and 64-thread wavefront would give `BucketSize = 8` and `TilesPerWarp = 8`.
-- **Stream support.** All operations currently run on the default stream. Adding a `cudaStream_t` parameter to host-side methods is a small change but hasn't been made.
+- **Full stream support.** `clear()` takes a `cudaStream_t` (defaulting to `gpurhh::default_stream`). The constructor does not — `cudaMalloc` is synchronous and dominates the construction cost, so threading a stream through the slot-init memset would buy nothing while leaving the constructor's overall behavior confusingly half-async. The destructor doesn't take a stream either; destruction is a host-side lifecycle event, and the caller is expected to synchronize relevant streams before letting the table go out of scope.
 
 ## Future work
 
