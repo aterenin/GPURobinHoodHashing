@@ -1,18 +1,20 @@
 #pragma once
 
 // Shared benchmark infrastructure: CUDA error checking, event-based
-// timing, append-mode CSV writer, deterministic uniform key generation.
+// timing, append-mode CSV recorder, deterministic uniform key generation.
 // Independent of the test suite — benchmarks should not pull in
 // <tests/...>.
-
-// Opt every benchmark TU into the gpurhh probe-counter API. Defined
-// before any gpurhh include so that View::insert / View::get expose
-// their counter parameters. See notes/design.md for the contract.
-#define GPURHH_BENCHMARK_COUNTERS 1
+//
+// This header deliberately does *not* define GPURHH_BENCHMARK_COUNTERS.
+// Counter-instrumented binaries (e.g. benchmark_insert_counters.cu)
+// define it themselves before including this header; comparison
+// binaries omit the define and get the counter-free View::insert /
+// View::get signatures.
 
 #include <gpurhh/hash_table.cuh>
 
 #include <cuda_runtime.h>
+#include <curand.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +42,16 @@ inline void operator>>(cudaError_t e, CudaCheckLoc loc) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "CUDA error at %s:%d: %s\n",
                      loc.file, loc.line, cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+// Same trick for cuRAND. cuRAND returns its own status code rather than
+// the CUDA error code, so it gets its own overload; the macro is shared.
+inline void operator>>(curandStatus_t e, CudaCheckLoc loc) {
+    if (e != CURAND_STATUS_SUCCESS) {
+        std::fprintf(stderr, "cuRAND error at %s:%d: code=%d\n",
+                     loc.file, loc.line, static_cast<int>(e));
         std::exit(1);
     }
 }
@@ -75,15 +87,15 @@ private:
     cudaEvent_t stop_{};
 };
 
-// CSV writer: appends rows to a file in the output directory, and also
-// echoes every row (plus the header) to stdout for live visibility.
+// Recorder: appends rows to a CSV file in the output directory, and
+// also echoes every row (plus the header) to stdout for live visibility.
 //
 // If the target file is new or empty when constructed, the header line
 // is written to the file first; if not, the file is appended to without
 // a fresh header (so a sweep over many invocations builds one CSV).
-class CSVWriter {
+class Recorder {
 public:
-    CSVWriter(const std::filesystem::path& path, std::string header)
+    Recorder(const std::filesystem::path& path, std::string header)
         : header_(std::move(header))
     {
         if (!path.parent_path().empty()) {
@@ -119,20 +131,61 @@ private:
     std::ofstream file_;
 };
 
-// Fill out[0..n) with fmix32(seed + i) mod range. For `range` a power
-// of two (the case here, since key range = α × capacity with capacity
-// a power of two), the modulus yields a uniform distribution.
+// RAII wrapper around a cuRAND Philox4_32_10 generator. Construct once
+// from a seed, then pass to fill_uniform_keys one or more times — cuRAND
+// holds the internal counter, so consecutive fills produce disjoint
+// streams from a single seed. This preserves the original "one seed,
+// two non-overlapping streams" design used by the get benchmarks.
 //
-// Not marked inline: __global__ functions cannot be inline, but each
-// benchmark binary is a single translation unit that includes this
-// header exactly once, so there is no multiple-definition concern.
-__global__ void fill_uniform_keys(
-    std::uint32_t* out, std::size_t n,
-    std::uint32_t seed, std::uint32_t range)
+// Philox is counter-based, deterministic, parallel, and fast (tens of
+// GB/s on a modern GPU). Bias from x % range is at most range / 2^32
+// per element, which is negligible for our key_range values.
+class UniformKeyGenerator {
+public:
+    explicit UniformKeyGenerator(std::uint64_t seed) {
+        curandCreateGenerator(&gen_, CURAND_RNG_PSEUDO_PHILOX4_32_10) >> CUDA_CHECK;
+        curandSetPseudoRandomGeneratorSeed(gen_, seed)                >> CUDA_CHECK;
+    }
+    ~UniformKeyGenerator() { curandDestroyGenerator(gen_); }
+    UniformKeyGenerator(const UniformKeyGenerator&)            = delete;
+    UniformKeyGenerator& operator=(const UniformKeyGenerator&) = delete;
+
+    curandGenerator_t handle() const { return gen_; }
+
+private:
+    curandGenerator_t gen_{};
+};
+
+// Map raw uint32 bits in-place to Uniform(0, range). For power-of-two
+// range (the common case — capacity is forced to a power of two), the
+// AND mask is many cycles cheaper than the divmod; the branch is uniform
+// within a warp since `range` is a kernel parameter.
+__global__ void map_to_range(
+    std::uint32_t* x, std::size_t n, std::uint32_t range)
 {
     const std::size_t tid = blockIdx.x * std::size_t{blockDim.x} + threadIdx.x;
     if (tid >= n) return;
-    out[tid] = gpurhh::detail::fmix32(static_cast<std::uint32_t>(tid) + seed) % range;
+    const std::uint32_t mask = range - 1;
+    if ((range & mask) == 0) x[tid] = x[tid] & mask;
+    else                     x[tid] = x[tid] % range;
+}
+
+// Fill `d_out[0..n)` with iid Uniform(0, range) draws using `gen`. All
+// work happens on the GPU: cuRAND writes raw bits into d_out, then the
+// map_to_range kernel folds them into [0, range). Both launches use the
+// default stream, so they serialize naturally with the timed kernel that
+// follows in run_benchmark_loop — and run_benchmark_loop's
+// cudaDeviceSynchronize between warmups and timed reps guarantees this
+// work has completed before the timing window opens.
+inline void fill_uniform_keys(
+    std::uint32_t* d_out, std::size_t n,
+    std::uint32_t range, UniformKeyGenerator& gen)
+{
+    curandGenerate(gen.handle(), d_out, n) >> CUDA_CHECK;
+    constexpr int block = 256;
+    const int grid = static_cast<int>((n + block - 1) / block);
+    map_to_range<<<grid, block>>>(d_out, n, range);
+    cudaGetLastError() >> CUDA_CHECK;
 }
 
 // Launch-shape sizing: queries the current device for SM count, derives a

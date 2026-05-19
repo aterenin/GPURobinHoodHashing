@@ -85,7 +85,7 @@ ALL_HEADERS := $(shell find include tests benchmarks -name "*.cuh" 2>/dev/null)
 
 .PHONY: all tests examples benchmarks test clean
 
-all: tests examples
+all: tests examples benchmarks
 
 tests:      $(TEST_BINS)
 examples:   $(EXAMPLE_BINS)
@@ -104,7 +104,7 @@ $(BUILD)/examples/%: examples/%.cu $(ALL_HEADERS)
 
 $(BUILD)/benchmarks/%: benchmarks/%.cu $(ALL_HEADERS)
 	@mkdir -p $(dir $@)
-	$(NVCC) $(NVCC_FLAGS_BENCHMARK) $< -o $@
+	$(NVCC) $(NVCC_FLAGS_BENCHMARK) $< -o $@ -lcurand
 
 # Baseline pattern rule — more specific than the catch-all benchmark
 # rule above, so it wins for targets under build/benchmarks/baselines/.
@@ -114,7 +114,7 @@ $(BUILD)/benchmarks/%: benchmarks/%.cu $(ALL_HEADERS)
 # (and harmless for warpcore).
 $(BUILD)/benchmarks/baselines/%: benchmarks/baselines/%.cu $(ALL_HEADERS)
 	@mkdir -p $(dir $@)
-	$(NVCC) $(NVCC_FLAGS_BENCHMARK) -I$(EXTERNAL_INCLUDE) --extended-lambda --expt-relaxed-constexpr $< -o $@
+	$(NVCC) $(NVCC_FLAGS_BENCHMARK) -I$(EXTERNAL_INCLUDE) --extended-lambda --expt-relaxed-constexpr $< -o $@ -lcurand
 
 clean:
 	rm -rf $(BUILD)

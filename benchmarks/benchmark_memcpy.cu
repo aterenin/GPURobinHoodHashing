@@ -76,19 +76,19 @@ __global__ void copy(uint4* dst, const uint4* src, std::size_t n) {
     if (tid < n) dst[tid] = src[tid];
 }
 
-std::string format_row(const std::string& workload, std::size_t bytes,
-                       int rep, const std::string& tag,
-                       float time_ms, double gbps)
+std::string format_row(const std::string& workload, const std::string& tag,
+                       int rep, std::uint32_t seed, std::size_t bytes,
+                       float time_ms)
 {
     std::ostringstream s;
     s.precision(9);
     s << "cuda,"
-      << workload << ","
-      << bytes << ","
-      << rep << ","
-      << tag << ","
-      << time_ms << ","
-      << gbps;
+      << workload   << ","
+      << tag        << ","
+      << rep        << ","
+      << seed       << ","
+      << bytes      << ","
+      << time_ms;
     return s.str();
 }
 
@@ -113,18 +113,14 @@ int main(int argc, char** argv) {
     // Fill the source buffer with non-trivial bytes so the kernel
     // doesn't accidentally measure a zero-page fast path.
     {
-        constexpr int fill_block = 256;
-        const int fill_grid =
-            static_cast<int>((n_u32 + fill_block - 1) / fill_block);
-        fill_uniform_keys<<<fill_grid, fill_block>>>(
-            d_src, n_u32, args.seed, std::uint32_t{1} << 31);
-        cudaGetLastError() >> CUDA_CHECK;
+        UniformKeyGenerator gen(args.seed);
+        fill_uniform_keys(d_src, n_u32, std::uint32_t{1} << 31, gen);
     }
     cudaMemset(d_dst, 0, bytes) >> CUDA_CHECK;
     cudaDeviceSynchronize() >> CUDA_CHECK;
 
-    CSVWriter csv(args.output_dir / "memcpy.csv",
-        "library,workload,bytes,rep,tag,time_ms,gbps_effective");
+    Recorder rec(args.output_dir / "memcpy.csv",
+        "library,workload,tag,rep,seed,bytes,time_ms");
 
     EventTimer timer;
 
@@ -133,10 +129,8 @@ int main(int argc, char** argv) {
             /*setup=*/  []() {},
             /*launch=*/ launch,
             /*after=*/  [&](int rep, float ms) {
-                // Two bytes of DRAM traffic per byte of payload.
-                const double gbps = 2.0 * static_cast<double>(bytes)
-                                  / (static_cast<double>(ms) * 1.0e6);
-                csv.write_row(format_row(workload, bytes, rep, args.tag, ms, gbps));
+                rec.write_row(format_row(
+                    workload, args.tag, rep, args.seed, bytes, ms));
             });
     };
 

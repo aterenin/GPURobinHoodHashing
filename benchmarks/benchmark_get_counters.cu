@@ -1,23 +1,14 @@
-// Get benchmark for gpurhh — comparison version.
+// Get benchmark for gpurhh — counter-instrumented version.
 //
-// Mirrors benchmark_insert.cu's apples-to-apples comparison setup:
-//   - replace_op reduction (no extra work on duplicate keys at pre-fill).
-//   - MaxProbeBuckets effectively uncapped.
-//   - No counter instrumentation.
+// Same shape as benchmark_get.cu, but with:
+//   - sum_op (to exercise the reduction path during pre-fill).
+//   - Default MaxProbeBuckets (= 8, study probe-cap regime).
+//   - Per-tile probe / hit counters via GPURHH_BENCHMARK_COUNTERS.
 //
-// Workload structure:
-//   1. Generate insert keys with a single cuRAND generator seeded by
-//      --seed (on GPU, untimed) and pre-fill the table once.
-//   2. For each timed rep, continue the same generator to draw a fresh
-//      n_ops get-key stream (in setup, untimed), then run and time the
-//      get kernel. Reps thus see iid input draws rather than 16 trials
-//      on one frozen input. The pre-fill is left one-shot since we are
-//      measuring get throughput; pre-fill input variability is a
-//      second-order effect for uniform keys at fixed F.
-//
-// The two key streams share no draws — the generator advances
-// sequentially — so one seed cleanly parameterizes the whole experiment.
-// All derived metrics live in the analysis script.
+// Writes to get_counters.csv with extra total_probes / total_hits /
+// total_misses columns; misses = n_ops - hits.
+
+#define GPURHH_BENCHMARK_COUNTERS 1
 
 #include "benchmarks.cuh"
 
@@ -29,8 +20,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <numeric>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace cg = cooperative_groups;
 
@@ -39,10 +32,7 @@ using Table = gpurhh::HashTable<
     std::uint32_t,
     gpurhh::default_hash<std::uint32_t>,
     gpurhh::default_empty_key<std::uint32_t>::key,
-    gpurhh::replace_op,
-    /*CacheLineBytes=*/128,
-    /*WarpSize=*/32,
-    /*MaxProbeBuckets=*/(1 << 20)>;
+    gpurhh::sum_op>;
 using View = Table::View;
 
 namespace {
@@ -62,13 +52,7 @@ struct Args {
 [[noreturn]] void die_usage(const char* prog) {
     std::fprintf(stderr,
         "usage: %s --output-dir DIR [options]\n"
-        "  --capacity N       Table size in slots (default 1<<27).\n"
-        "  --key-range N      N in Uniform(0, N) for key generation.\n"
-        "  --n-ops N          Number of get attempts (also pre-fill count).\n"
-        "  --block-size N     Threads per CUDA block.\n"
-        "  --warmups N --reps N --tag STR --output-dir DIR\n"
-        "  --seed N           PRNG seed (default 42). One generator produces\n"
-        "                     n_ops insert keys, then n_ops more get keys.\n",
+        "  Same shape as benchmark_get. Writes get_counters.csv.\n",
         prog);
     std::exit(1);
 }
@@ -100,8 +84,6 @@ Args parse_args(int argc, char** argv) {
     return a;
 }
 
-// Pre-fill kernel (untimed). Reuses the same insert path the comparison
-// version uses elsewhere. No counter tracking.
 __global__ void prefill(
     View view,
     const std::uint32_t* __restrict__ keys,
@@ -116,10 +98,12 @@ __global__ void prefill(
     const std::size_t total_tiles =
         std::size_t{gridDim.x} * tiles_per_block;
 
+    std::uint32_t scratch_probes = 0;  // discarded; only counts during prefill
+
     for (std::size_t op_id = tile_id; op_id < n_ops; op_id += total_tiles) {
         const std::uint32_t k = keys[op_id];
         const std::uint32_t v = gpurhh::detail::fmix32(k);
-        (void) view.insert(tile, k, v);
+        (void) view.insert(tile, k, v, scratch_probes);
     }
 }
 
@@ -127,7 +111,9 @@ __global__ void get(
     View view,
     const std::uint32_t* __restrict__ keys,
     std::uint32_t* __restrict__ out,
-    std::size_t n_ops)
+    std::size_t n_ops,
+    std::uint32_t* __restrict__ per_tile_probes,
+    std::uint32_t* __restrict__ per_tile_hits)
 {
     auto block = cg::this_thread_block();
     auto tile  = cg::tiled_partition<Table::tile_size>(block);
@@ -138,12 +124,21 @@ __global__ void get(
     const std::size_t total_tiles =
         std::size_t{gridDim.x} * tiles_per_block;
 
+    std::uint32_t my_probes = 0;
+    std::uint32_t my_hits   = 0;
+
     for (std::size_t op_id = tile_id; op_id < n_ops; op_id += total_tiles) {
         const std::uint32_t k = keys[op_id];
-        const auto result = view.get(tile, k);
+        const auto result = view.get(tile, k, my_probes);
         if (tile.thread_rank() == 0) {
             out[op_id] = result.value_or(~std::uint32_t{0});
+            if (result.has_value()) ++my_hits;
         }
+    }
+
+    if (tile.thread_rank() == 0) {
+        per_tile_probes[tile_id] = my_probes;
+        per_tile_hits  [tile_id] = my_hits;
     }
 }
 
@@ -151,7 +146,8 @@ std::string format_row(
     std::size_t capacity, std::size_t key_range, std::size_t n_ops,
     int block_size, std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
-    float time_ms)
+    float time_ms,
+    std::uint64_t total_probes, std::uint64_t total_hits, std::uint64_t total_misses)
 {
     std::ostringstream s;
     s.precision(9);
@@ -165,7 +161,10 @@ std::string format_row(
       << block_size    << ","
       << slot_bytes    << ","
       << bytes_per_op  << ","
-      << time_ms;
+      << time_ms       << ","
+      << total_probes  << ","
+      << total_hits    << ","
+      << total_misses;
     return s.str();
 }
 
@@ -182,16 +181,14 @@ int main(int argc, char** argv) {
     const std::uint32_t key_range = static_cast<std::uint32_t>(args.key_range);
 
     std::fprintf(stderr,
-        "[get] capacity=%zu key_range=%zu n_ops=%zu "
+        "[get-counters] capacity=%zu key_range=%zu n_ops=%zu "
         "block_size=%d warmups=%d reps=%d seed=%u tag=\"%s\"\n",
         capacity, args.key_range, args.n_ops,
         args.block_size, args.warmups, args.reps,
         args.seed, args.tag.c_str());
 
-    // One cuRAND generator, two sequential disjoint streams: first n_ops
-    // draws become the insert (pre-fill) keys, next n_ops draws become
-    // the get keys. Both fills happen on the GPU before any timed work
-    // begins, so they are not part of the measurement.
+    // Same single-generator scheme as benchmark_get.cu: n_ops draws for
+    // the insert stream, then n_ops more draws for the get stream.
     UniformKeyGenerator gen(args.seed);
 
     // --- pre-fill (untimed) ---
@@ -200,6 +197,7 @@ int main(int argc, char** argv) {
     fill_uniform_keys(d_insert_keys, args.n_ops, key_range, gen);
 
     const auto shape = compute_launch_shape(args.block_size, Table::tile_size);
+    const std::size_t n_tiles = shape.n_tiles;
 
     prefill<<<shape.grid_size, args.block_size>>>(
         table.view(), d_insert_keys, args.n_ops);
@@ -207,37 +205,62 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize() >> CUDA_CHECK;
     cudaFree(d_insert_keys);
 
-    // --- get key buffer (refilled in setup per rep from the continuing
-    //     generator stream, so reps see iid get-key draws) ---
+    // --- get keys (refilled in setup per rep) ---
     std::uint32_t* d_get_keys = nullptr;
     cudaMalloc(&d_get_keys, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
 
     std::uint32_t* d_out = nullptr;
     cudaMalloc(&d_out, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
 
-    Recorder rec(args.output_dir / "get.csv",
+    std::uint32_t* d_probes = nullptr;
+    std::uint32_t* d_hits   = nullptr;
+    cudaMalloc(&d_probes, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+    cudaMalloc(&d_hits,   n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+    std::vector<std::uint32_t> h_probes(n_tiles);
+    std::vector<std::uint32_t> h_hits  (n_tiles);
+
+    Recorder rec(args.output_dir / "get_counters.csv",
         "library,workload,tag,rep,seed,capacity,key_range,"
-        "n_ops,block_size,slot_bytes,bytes_per_op,time_ms");
+        "n_ops,block_size,slot_bytes,bytes_per_op,time_ms,"
+        "total_probes,total_hits,total_misses");
 
     EventTimer timer;
 
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
             fill_uniform_keys(d_get_keys, args.n_ops, key_range, gen);
+            cudaMemset(d_probes, 0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+            cudaMemset(d_hits,   0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
         },
         /*launch=*/ [&]() {
             get<<<shape.grid_size, args.block_size>>>(
-                table.view(), d_get_keys, d_out, args.n_ops);
+                table.view(), d_get_keys, d_out, args.n_ops,
+                d_probes, d_hits);
             cudaGetLastError() >> CUDA_CHECK;
         },
         /*after=*/  [&](int rep, float ms) {
+            cudaMemcpy(h_probes.data(), d_probes,
+                       n_tiles * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+            cudaMemcpy(h_hits.data(),   d_hits,
+                       n_tiles * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+            const std::uint64_t total_probes =
+                std::accumulate(h_probes.begin(), h_probes.end(), std::uint64_t{0});
+            const std::uint64_t total_hits =
+                std::accumulate(h_hits.begin(),   h_hits.end(),   std::uint64_t{0});
+            const std::uint64_t total_misses =
+                std::uint64_t{args.n_ops} - total_hits;
             rec.write_row(format_row(
                 capacity, args.key_range, args.n_ops,
                 args.block_size, slot_bytes, bytes_per_op,
-                args.seed, rep, args.tag, ms));
+                args.seed, rep, args.tag,
+                ms, total_probes, total_hits, total_misses));
         });
 
     cudaFree(d_get_keys);
     cudaFree(d_out);
+    cudaFree(d_probes);
+    cudaFree(d_hits);
     return 0;
 }
