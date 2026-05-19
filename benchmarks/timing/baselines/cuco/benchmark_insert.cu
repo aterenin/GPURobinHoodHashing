@@ -8,6 +8,7 @@
 
 #include <cuco/static_map.cuh>
 
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 
 #include <cuda_runtime.h>
@@ -30,7 +31,6 @@ namespace {
 
 struct Args {
     std::size_t   capacity   = std::size_t{1} << 27;
-    std::size_t   key_range  = std::size_t{1} << 27;
     std::size_t   n_ops      = std::size_t{1} << 27;
     int           warmups    = 2;
     int           reps       = 16;
@@ -45,7 +45,6 @@ Args parse_args(int argc, char** argv) {
     Args a;
     ArgParser p(argv[0]);
     p.add("--capacity",   a.capacity,   "Table size in slots")
-     .add("--key-range",  a.key_range,  "N in Uniform(0, N) for key generation")
      .add("--n-ops",      a.n_ops,      "Number of insert attempts")
      .add("--warmups",    a.warmups,    "Untimed warmup reps")
      .add("--reps",       a.reps,       "Timed reps")
@@ -55,15 +54,14 @@ Args parse_args(int argc, char** argv) {
     p.parse(argc, argv);
 
     if (a.output_dir.empty()) p.print_usage();
-    if (a.n_ops == 0)         { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
-    if (a.key_range == 0)     { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
+    if (a.n_ops == 0)         { std::fprintf(stderr, "--n-ops must be > 0\n"); std::exit(1); }
     return a;
 }
 
 // Matches benchmark_insert.cu's schema. block_size cell is empty for
 // cuco (no exposed launch knob).
 std::string format_row(
-    std::size_t capacity, std::size_t key_range, std::size_t n_ops,
+    std::size_t capacity, std::size_t n_ops,
     std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
     float time_ms)
@@ -75,7 +73,6 @@ std::string format_row(
       << rep          << ","
       << seed         << ","
       << capacity     << ","
-      << key_range    << ","
       << n_ops        << ","
       << ","          // block_size empty for cuco
       << slot_bytes   << ","
@@ -91,25 +88,33 @@ int main(int argc, char** argv) {
 
     constexpr std::size_t slot_bytes   = sizeof(Key) + sizeof(Value);
     constexpr std::size_t bytes_per_op = 128;
-    const Key key_range = static_cast<Key>(args.key_range);
 
     std::fprintf(stderr,
-        "[cuco insert] capacity=%zu key_range=%zu n_ops=%zu "
+        "[cuco insert] capacity=%zu n_ops=%zu "
         "warmups=%d reps=%d seed=%u tag=\"%s\"\n",
-        args.capacity, args.key_range, args.n_ops,
+        args.capacity, args.n_ops,
         args.warmups, args.reps, args.seed, args.tag.c_str());
 
-    Key* d_keys = nullptr;
-    cudaMalloc(&d_keys, args.n_ops * sizeof(Key)) >> CUDA_CHECK;
+    // d_keys: refreshed per rep in setup.
+    // d_values: zeroed once below. Apples-to-apples with gpurhh's timing
+    // build — the cuco insert kernel pays the d_values input read via
+    // the transform iterator below, even though under replace_op the
+    // value content is irrelevant.
+    Key*   d_keys   = nullptr;
+    Value* d_values = nullptr;
+    cudaMalloc(&d_keys,   args.n_ops * sizeof(Key))   >> CUDA_CHECK;
+    cudaMalloc(&d_values, args.n_ops * sizeof(Value)) >> CUDA_CHECK;
+    cudaMemset(d_values, 0, args.n_ops * sizeof(Value)) >> CUDA_CHECK;
     UniformKeyGenerator gen(args.seed);
 
-    // Transform iterator: builds cuco::pair<Key, Value> on the fly from
-    // each key, with value = fmix32(key). Matches the gpurhh benchmark's
-    // value-derivation choice.
+    // Transform iterator over a counting iterator: at index i, reads
+    // d_keys[i] and d_values[i] and packs them into a cuco::pair. The
+    // captured pointers are device-side; the lambda runs on GPU
+    // (--extended-lambda).
     auto pair_begin = thrust::make_transform_iterator(
-        d_keys,
-        [] __device__ (Key k) -> cuco::pair<Key, Value> {
-            return cuco::pair<Key, Value>{k, gpurhh::detail::fmix32(k)};
+        thrust::counting_iterator<std::size_t>(0),
+        [d_keys, d_values] __device__ (std::size_t i) -> cuco::pair<Key, Value> {
+            return cuco::pair<Key, Value>{d_keys[i], d_values[i]};
         });
 
     cuco::static_map<Key, Value> map{
@@ -118,7 +123,7 @@ int main(int argc, char** argv) {
         cuco::empty_value<Value>{EMPTY_VALUE}};
 
     Recorder rec(args.output_dir / "insert.csv",
-        "library,workload,tag,rep,seed,capacity,key_range,n_ops,block_size,"
+        "library,workload,tag,rep,seed,capacity,n_ops,block_size,"
         "slot_bytes,bytes_per_op,time_ms");
 
     EventTimer timer;
@@ -126,16 +131,17 @@ int main(int argc, char** argv) {
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
             map.clear_async();
-            fill_uniform_keys(d_keys, args.n_ops, key_range, gen);
+            fill_uniform_keys(d_keys, args.n_ops, gen);
         },
         /*launch=*/ [&]() { map.insert_async(pair_begin, pair_begin + args.n_ops); },
         /*after=*/  [&](int rep, float ms) {
             rec.write_row(format_row(
-                args.capacity, args.key_range, args.n_ops,
+                args.capacity, args.n_ops,
                 slot_bytes, bytes_per_op,
                 args.seed, rep, args.tag, ms));
         });
 
     cudaFree(d_keys);
+    cudaFree(d_values);
     return 0;
 }

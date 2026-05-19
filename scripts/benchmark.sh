@@ -151,14 +151,14 @@ echo "==> Writing CSV output and run_info to ${OUTPUT_DIR}"
 
 # --- sweep grid ----------------------------------------------------------
 #
-# Capacity is fixed at 1 GiB worth of slots (DRAM-resident). α = 1 by
-# default: key_range = capacity. We sweep n_ops via convenient
-# multipliers, computed once below into a list of raw integer counts.
+# Capacity is fixed at 1 GiB worth of slots (DRAM-resident). Keys are
+# raw uint32 samples (Uniform on [0, 2^32)), so α = 2^32 / capacity ≈ 32
+# — essentially unique keys, the collision-resolution regime where table
+# designs differ. We sweep n_ops via convenient multipliers below.
 # block_size is swept for gpurhh; cuco/warpcore have their own internal
 # launch shapes.
 SLOT_BYTES=8
 CAPACITY=$(( (1024 * 1024 * 1024) / SLOT_BYTES ))   # 1 GiB / 8 = 2^27
-KEY_RANGE=${CAPACITY}                                # α = 1
 BLOCK_SIZES=(64 128 256 512 1024)
 TAG="sweep"
 
@@ -199,7 +199,6 @@ if [[ "${RUN_TIMING}" -eq 1 ]]; then
             "${TIMING_BIN}/benchmark_insert" \
                 --output-dir "${TIMING_OUT}" \
                 --capacity "${CAPACITY}" \
-                --key-range "${KEY_RANGE}" \
                 --n-ops "${n_ops}" \
                 --block-size "${b}" \
                 --reps "${REPS}" \
@@ -210,7 +209,6 @@ if [[ "${RUN_TIMING}" -eq 1 ]]; then
             "${TIMING_BIN}/benchmark_get" \
                 --output-dir "${TIMING_OUT}" \
                 --capacity "${CAPACITY}" \
-                --key-range "${KEY_RANGE}" \
                 --n-ops "${n_ops}" \
                 --block-size "${b}" \
                 --reps "${REPS}" \
@@ -228,7 +226,6 @@ if [[ "${RUN_MEMORY}" -eq 1 ]]; then
             "${MEMORY_BIN}/benchmark_insert" \
                 --output-dir "${MEMORY_OUT}" \
                 --capacity "${CAPACITY}" \
-                --key-range "${KEY_RANGE}" \
                 --n-ops "${n_ops}" \
                 --block-size "${b}" \
                 --reps "${REPS}" \
@@ -239,7 +236,6 @@ if [[ "${RUN_MEMORY}" -eq 1 ]]; then
             "${MEMORY_BIN}/benchmark_get" \
                 --output-dir "${MEMORY_OUT}" \
                 --capacity "${CAPACITY}" \
-                --key-range "${KEY_RANGE}" \
                 --n-ops "${n_ops}" \
                 --block-size "${b}" \
                 --reps "${REPS}" \
@@ -256,7 +252,6 @@ if [[ "${RUN_CUCO}" -eq 1 ]]; then
         "${CUCO_BIN}/benchmark_insert" \
             --output-dir "${TIMING_OUT}" \
             --capacity "${CAPACITY}" \
-            --key-range "${KEY_RANGE}" \
             --n-ops "${n_ops}" \
             --reps "${REPS}" \
             --seed "${SEED}" \
@@ -266,7 +261,6 @@ if [[ "${RUN_CUCO}" -eq 1 ]]; then
         "${CUCO_BIN}/benchmark_get" \
             --output-dir "${TIMING_OUT}" \
             --capacity "${CAPACITY}" \
-            --key-range "${KEY_RANGE}" \
             --n-ops "${n_ops}" \
             --reps "${REPS}" \
             --seed "${SEED}" \
@@ -281,7 +275,6 @@ if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
         "${WARPCORE_BIN}/benchmark_insert" \
             --output-dir "${TIMING_OUT}" \
             --capacity "${CAPACITY}" \
-            --key-range "${KEY_RANGE}" \
             --n-ops "${n_ops}" \
             --reps "${REPS}" \
             --seed "${SEED}" \
@@ -291,7 +284,6 @@ if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
         "${WARPCORE_BIN}/benchmark_get" \
             --output-dir "${TIMING_OUT}" \
             --capacity "${CAPACITY}" \
-            --key-range "${KEY_RANGE}" \
             --n-ops "${n_ops}" \
             --reps "${REPS}" \
             --seed "${SEED}" \

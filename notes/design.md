@@ -385,9 +385,13 @@ Three executables:
 ### Workload knobs
 
 - **`capacity`** is held at 1 GiB by default — well past the L2 cache on any sm_89 device, putting the kernel firmly in the DRAM-bound regime.
-- **`α = key_range / capacity`** is fixed at 1: keys are drawn from `Uniform(0, capacity)`, which gives the cleanest relationship between input load factor F and expected occupancy.
-- **`F = n_ops / capacity`** is the swept axis. The sweep grid is `F ∈ {0.5, 1.0, 1.5, 2.0, 3.0}`. At low F the table is mostly empty and Robin Hood barely engages; the interesting cliff is in F = 2.0–3.0 where occupancy approaches 0.9+ and probe distances grow.
+- **Key distribution** is raw `Uniform(0, 2^32)` — every uint32 is equally likely, no clamping. With capacity = 2^27, this gives `α = key_range / capacity ≈ 32`: keys are effectively unique. This is the collision-resolution regime where table designs actually differ; at much smaller α the table fills very slowly with duplicates and linear probing's pathological clustering never engages.
+- **`F = n_ops / capacity`** is the swept axis. The sweep grid is `F ∈ {0.5, 1.0, 1.5, 2.0, 3.0}`. With α ≈ 32, effective occupancy ≈ F up to ~0.97, so this puts F = 0.9–1.0 squarely in the high-occupancy regime where Robin Hood's variance reduction matters and beyond F = 1 we're stress-testing failure modes.
 - **`block_size ∈ {64, 128, 256, 512, 1024}`** is swept to spot-check that launch shape doesn't dominate (it typically doesn't for bandwidth-bound kernels, but worth verifying once per workload).
+
+#### Alternative: small α to exercise the reduction path
+
+The default sweep deliberately uses near-unique keys to compare collision-resolution strategies, not reduction behavior. A separate study could replace raw uint32 keys with `Uniform(0, N)` for some small N (e.g. `N = capacity`, giving α = 1). At α = 1 most inserts collide on existing keys, each slot's value goes through many `Reduction` calls, and `sum_op` accumulates an actual sum instead of just storing one value. That would stress the CAS-retry loop and reduction functor along the dimension this sweep skips. The benchmark binaries currently take the raw cuRAND output unmodified; supporting a custom key range would add a small clamp kernel and one CLI flag.
 
 ### Per-tile probe counters
 

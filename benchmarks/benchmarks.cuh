@@ -142,8 +142,7 @@ private:
 // two non-overlapping streams" design used by the get benchmarks.
 //
 // Philox is counter-based, deterministic, parallel, and fast (tens of
-// GB/s on a modern GPU). Bias from x % range is at most range / 2^32
-// per element, which is negligible for our key_range values.
+// GB/s on a modern GPU).
 class UniformKeyGenerator {
 public:
     explicit UniformKeyGenerator(std::uint64_t seed) {
@@ -160,36 +159,21 @@ private:
     curandGenerator_t gen_{};
 };
 
-// Map raw uint32 bits in-place to Uniform(0, range). For power-of-two
-// range (the common case — capacity is forced to a power of two), the
-// AND mask is many cycles cheaper than the divmod; the branch is uniform
-// within a warp since `range` is a kernel parameter.
-__global__ void map_to_range(
-    std::uint32_t* x, std::size_t n, std::uint32_t range)
-{
-    const std::size_t tid = blockIdx.x * std::size_t{blockDim.x} + threadIdx.x;
-    if (tid >= n) return;
-    const std::uint32_t mask = range - 1;
-    if ((range & mask) == 0) x[tid] = x[tid] & mask;
-    else                     x[tid] = x[tid] % range;
-}
-
-// Fill `d_out[0..n)` with iid Uniform(0, range) draws using `gen`. All
-// work happens on the GPU: cuRAND writes raw bits into d_out, then the
-// map_to_range kernel folds them into [0, range). Both launches use the
-// default stream, so they serialize naturally with the timed kernel that
-// follows in run_benchmark_loop — and run_benchmark_loop's
-// cudaDeviceSynchronize between warmups and timed reps guarantees this
-// work has completed before the timing window opens.
+// Fill `d_out[0..n)` with iid uniform uint32 draws — i.e. Uniform(0, 2^32),
+// the full type range. cuRAND writes directly into the uint32 buffer, so
+// no clamping kernel is needed.
+//
+// The benchmark grid intentionally fixes the key distribution at the full
+// uint32 range: combined with our 2^27-slot table, this gives α ≈ 32,
+// keys are effectively unique, and we are squarely in the collision-
+// resolution regime where table designs differ. If you instead want to
+// stress the duplicate-collapse / reduction path (α ≈ 1, ~63% peak
+// occupancy), see the note in notes/design.md — restoring that mode
+// takes ~30 lines (a small clamp kernel plus a --key-range flag).
 inline void fill_uniform_keys(
-    std::uint32_t* d_out, std::size_t n,
-    std::uint32_t range, UniformKeyGenerator& gen)
+    std::uint32_t* d_out, std::size_t n, UniformKeyGenerator& gen)
 {
     curandGenerate(gen.handle(), d_out, n) >> CUDA_CHECK;
-    constexpr int block = 256;
-    const int grid = static_cast<int>((n + block - 1) / block);
-    map_to_range<<<grid, block>>>(d_out, n, range);
-    cudaGetLastError() >> CUDA_CHECK;
 }
 
 // Launch-shape sizing: queries the current device for SM count, derives a
@@ -223,8 +207,8 @@ inline LaunchShape compute_launch_shape(int block_size, int tile_size) {
 // Each binary builds an Args struct with default values, then writes:
 //
 //     ArgParser p(argv[0]);
-//     p.add("--capacity",   a.capacity,   "Table size in slots");
-//     p.add("--key-range",  a.key_range,  "N in Uniform(0, N)");
+//     p.add("--capacity", a.capacity, "Table size in slots");
+//     p.add("--n-ops",    a.n_ops,    "Number of operations");
 //     ...
 //     p.parse(argc, argv);
 //     // post-parse validation here, calling p.print_usage() on failure

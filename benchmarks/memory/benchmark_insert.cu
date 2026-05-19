@@ -41,7 +41,6 @@ namespace {
 
 struct Args {
     std::size_t   capacity   = std::size_t{1} << 27;
-    std::size_t   key_range  = std::size_t{1} << 27;
     std::size_t   n_ops      = std::size_t{1} << 27;
     int           block_size = 256;
     int           warmups    = 2;
@@ -55,7 +54,6 @@ Args parse_args(int argc, char** argv) {
     Args a;
     ArgParser p(argv[0]);
     p.add("--capacity",   a.capacity,   "Table size in slots")
-     .add("--key-range",  a.key_range,  "N in Uniform(0, N) for key generation")
      .add("--n-ops",      a.n_ops,      "Number of insert attempts")
      .add("--block-size", a.block_size, "Threads per CUDA block; multiple of tile_size")
      .add("--warmups",    a.warmups,    "Untimed warmup reps")
@@ -66,8 +64,7 @@ Args parse_args(int argc, char** argv) {
     p.parse(argc, argv);
 
     if (a.output_dir.empty())                     p.print_usage();
-    if (a.n_ops == 0)                             { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
-    if (a.key_range == 0)                         { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
+    if (a.n_ops == 0)                             { std::fprintf(stderr, "--n-ops must be > 0\n"); std::exit(1); }
     if (a.block_size % Table::tile_size != 0)     { std::fprintf(stderr, "--block-size must be a multiple of tile_size (%d)\n", Table::tile_size); std::exit(1); }
     if (a.block_size <= 0 || a.block_size > 1024) { std::fprintf(stderr, "--block-size out of range\n"); std::exit(1); }
     return a;
@@ -108,7 +105,7 @@ __global__ void insert(
 }
 
 std::string format_row(
-    std::size_t capacity, std::size_t key_range, std::size_t n_ops,
+    std::size_t capacity, std::size_t n_ops,
     int block_size, std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
     float time_ms, std::uint64_t total_probes, std::uint64_t total_failures)
@@ -120,7 +117,6 @@ std::string format_row(
       << rep           << ","
       << seed          << ","
       << capacity      << ","
-      << key_range     << ","
       << n_ops         << ","
       << block_size    << ","
       << slot_bytes    << ","
@@ -141,12 +137,11 @@ int main(int argc, char** argv) {
 
     Table table(args.capacity);
     const std::size_t capacity = table.capacity();
-    const std::uint32_t key_range = static_cast<std::uint32_t>(args.key_range);
 
     std::fprintf(stderr,
-        "[memory insert] capacity=%zu key_range=%zu n_ops=%zu "
+        "[memory insert] capacity=%zu n_ops=%zu "
         "block_size=%d warmups=%d reps=%d seed=%u tag=\"%s\"\n",
-        capacity, args.key_range, args.n_ops,
+        capacity, args.n_ops,
         args.block_size, args.warmups, args.reps, args.seed, args.tag.c_str());
 
     std::uint32_t* d_keys = nullptr;
@@ -164,7 +159,7 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> h_failures(n_tiles);
 
     Recorder rec(args.output_dir / "insert.csv",
-        "library,workload,tag,rep,seed,capacity,key_range,n_ops,block_size,"
+        "library,workload,tag,rep,seed,capacity,n_ops,block_size,"
         "slot_bytes,bytes_per_op,time_ms,total_probes,total_failures");
 
     EventTimer timer;
@@ -172,7 +167,7 @@ int main(int argc, char** argv) {
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
             table.clear();
-            fill_uniform_keys(d_keys, args.n_ops, key_range, gen);
+            fill_uniform_keys(d_keys, args.n_ops, gen);
             cudaMemset(d_probes,   0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
             cudaMemset(d_failures, 0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
         },
@@ -193,7 +188,7 @@ int main(int argc, char** argv) {
             const std::uint64_t total_failures =
                 std::accumulate(h_failures.begin(), h_failures.end(), std::uint64_t{0});
             rec.write_row(format_row(
-                capacity, args.key_range, args.n_ops,
+                capacity, args.n_ops,
                 args.block_size, slot_bytes, bytes_per_op,
                 args.seed, rep, args.tag,
                 ms, total_probes, total_failures));

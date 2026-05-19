@@ -22,7 +22,6 @@ namespace {
 
 struct Args {
     std::size_t   capacity   = std::size_t{1} << 27;
-    std::size_t   key_range  = std::size_t{1} << 27;
     std::size_t   n_ops      = std::size_t{1} << 27;
     int           warmups    = 2;
     int           reps       = 16;
@@ -35,7 +34,6 @@ Args parse_args(int argc, char** argv) {
     Args a;
     ArgParser p(argv[0]);
     p.add("--capacity",   a.capacity,   "Table size in slots")
-     .add("--key-range",  a.key_range,  "N in Uniform(0, N) for key generation")
      .add("--n-ops",      a.n_ops,      "Number of get attempts (also pre-fill count)")
      .add("--warmups",    a.warmups,    "Untimed warmup reps")
      .add("--reps",       a.reps,       "Timed reps")
@@ -45,13 +43,12 @@ Args parse_args(int argc, char** argv) {
     p.parse(argc, argv);
 
     if (a.output_dir.empty()) p.print_usage();
-    if (a.n_ops == 0)         { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
-    if (a.key_range == 0)     { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
+    if (a.n_ops == 0)         { std::fprintf(stderr, "--n-ops must be > 0\n"); std::exit(1); }
     return a;
 }
 
 std::string format_row(
-    std::size_t capacity, std::size_t key_range, std::size_t n_ops,
+    std::size_t capacity, std::size_t n_ops,
     std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
     float time_ms)
@@ -63,7 +60,6 @@ std::string format_row(
       << rep          << ","
       << seed         << ","
       << capacity     << ","
-      << key_range    << ","
       << n_ops        << ","
       << ","          // block_size empty for warpcore
       << slot_bytes   << ","
@@ -87,12 +83,11 @@ int main(int argc, char** argv) {
 
     constexpr std::size_t slot_bytes   = sizeof(Key) + sizeof(Value);
     constexpr std::size_t bytes_per_op = 128;
-    const Key key_range = static_cast<Key>(args.key_range);
 
     std::fprintf(stderr,
-        "[warpcore get] capacity=%zu key_range=%zu n_ops=%zu "
+        "[warpcore get] capacity=%zu n_ops=%zu "
         "warmups=%d reps=%d seed=%u tag=\"%s\"\n",
-        args.capacity, args.key_range, args.n_ops,
+        args.capacity, args.n_ops,
         args.warmups, args.reps, args.seed, args.tag.c_str());
 
     // Single cuRAND generator, sequential disjoint streams: first n_ops
@@ -104,7 +99,7 @@ int main(int argc, char** argv) {
     Value* d_insert_values = nullptr;
     cudaMalloc(&d_insert_keys,   args.n_ops * sizeof(Key))   >> CUDA_CHECK;
     cudaMalloc(&d_insert_values, args.n_ops * sizeof(Value)) >> CUDA_CHECK;
-    fill_uniform_keys(d_insert_keys, args.n_ops, key_range, gen);
+    fill_uniform_keys(d_insert_keys, args.n_ops, gen);
     {
         constexpr int fill_block = 256;
         const int fill_grid =
@@ -127,21 +122,21 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_out, args.n_ops * sizeof(Value)) >> CUDA_CHECK;
 
     Recorder rec(args.output_dir / "get.csv",
-        "library,workload,tag,rep,seed,capacity,key_range,"
+        "library,workload,tag,rep,seed,capacity,"
         "n_ops,block_size,slot_bytes,bytes_per_op,time_ms");
 
     EventTimer timer;
 
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
-            fill_uniform_keys(d_get_keys, args.n_ops, key_range, gen);
+            fill_uniform_keys(d_get_keys, args.n_ops, gen);
         },
         /*launch=*/ [&]() {
             table.retrieve(d_get_keys, args.n_ops, d_out);
         },
         /*after=*/  [&](int rep, float ms) {
             rec.write_row(format_row(
-                args.capacity, args.key_range, args.n_ops,
+                args.capacity, args.n_ops,
                 slot_bytes, bytes_per_op,
                 args.seed, rep, args.tag, ms));
         });

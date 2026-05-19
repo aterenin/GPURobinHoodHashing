@@ -5,14 +5,27 @@
 //   - MaxProbeBuckets: 1 << 20 (effectively uncapped, matching the
 //     baselines' unbounded probe semantics).
 //   - No counter instrumentation in the hot path.
+//   - Values pre-materialized in a separate d_values buffer that the
+//     timed insert kernel reads alongside d_keys. Mirrors warpcore's
+//     API shape and makes cuco's pair-iterator path do the same work.
+//     Under replace_op the *content* of the values is irrelevant to
+//     timing (the insert kernel writes whatever it reads), so we just
+//     zero d_values once before the loop and skip the per-rep derive.
+//     The memory benchmark under benchmarks/memory/ keeps the inline
+//     `v = fmix32(k)` pattern since it uses sum_op, where the actual
+//     reduction work is what's being instrumented.
 //
 // Workload:
 //   - Key type uint32_t, value type uint32_t.
-//   - Keys drawn from Uniform(0, key_range) at runtime.
+//   - Keys drawn from Uniform(0, 2^32) — i.e. raw cuRAND output, no
+//     clamping. With capacity 2^27 this gives α ≈ 32 (essentially
+//     unique-keys), which is the regime where collision-resolution
+//     strategy actually matters. See notes/design.md for the α=1
+//     duplicate-stress alternative.
 //   - Single ~1 GiB table by default, DRAM-resident.
 //
 // Per timed sample:
-//   1. Empty the table via table.clear() (untimed).
+//   1. Empty the table, refill d_keys + d_values (untimed setup).
 //   2. Time one kernel that processes n_ops insert ops in a grid-stride loop.
 //   3. Emit a CSV row recording the raw configuration + measured time.
 //
@@ -50,7 +63,6 @@ namespace {
 
 struct Args {
     std::size_t   capacity   = std::size_t{1} << 27;  // 1 GiB at 8 B/slot
-    std::size_t   key_range  = std::size_t{1} << 27;
     std::size_t   n_ops      = std::size_t{1} << 27;
     int           block_size = 256;
     int           warmups    = 2;
@@ -64,7 +76,6 @@ Args parse_args(int argc, char** argv) {
     Args a;
     ArgParser p(argv[0]);
     p.add("--capacity",   a.capacity,   "Table size in slots (rounded up to next pow2)")
-     .add("--key-range",  a.key_range,  "N in Uniform(0, N) used for key generation")
      .add("--n-ops",      a.n_ops,      "Number of insert attempts")
      .add("--block-size", a.block_size, "Threads per CUDA block; multiple of tile_size")
      .add("--warmups",    a.warmups,    "Untimed warmup reps")
@@ -76,7 +87,6 @@ Args parse_args(int argc, char** argv) {
 
     if (a.output_dir.empty())                     p.print_usage();
     if (a.n_ops == 0)                             { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
-    if (a.key_range == 0)                         { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
     if (a.block_size % Table::tile_size != 0)     { std::fprintf(stderr, "--block-size must be a multiple of tile_size (%d)\n", Table::tile_size); std::exit(1); }
     if (a.block_size <= 0 || a.block_size > 1024) { std::fprintf(stderr, "--block-size out of range\n"); std::exit(1); }
     return a;
@@ -85,6 +95,7 @@ Args parse_args(int argc, char** argv) {
 __global__ void insert(
     View view,
     const std::uint32_t* __restrict__ keys,
+    const std::uint32_t* __restrict__ values,
     std::size_t n_ops)
 {
     auto block = cg::this_thread_block();
@@ -98,13 +109,13 @@ __global__ void insert(
 
     for (std::size_t op_id = tile_id; op_id < n_ops; op_id += total_tiles) {
         const std::uint32_t k = keys[op_id];
-        const std::uint32_t v = gpurhh::detail::fmix32(k);
+        const std::uint32_t v = values[op_id];
         (void) view.insert(tile, k, v);
     }
 }
 
 std::string format_row(
-    std::size_t capacity, std::size_t key_range, std::size_t n_ops,
+    std::size_t capacity, std::size_t n_ops,
     int block_size, std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
     float time_ms)
@@ -116,7 +127,6 @@ std::string format_row(
       << rep           << ","
       << seed          << ","
       << capacity      << ","
-      << key_range     << ","
       << n_ops         << ","
       << block_size    << ","
       << slot_bytes    << ","
@@ -135,25 +145,30 @@ int main(int argc, char** argv) {
 
     Table table(args.capacity);
     const std::size_t capacity = table.capacity();
-    const std::uint32_t key_range = static_cast<std::uint32_t>(args.key_range);
 
     std::fprintf(stderr,
-        "[insert] capacity=%zu key_range=%zu n_ops=%zu "
+        "[insert] capacity=%zu n_ops=%zu "
         "block_size=%d warmups=%d reps=%d seed=%u tag=\"%s\"\n",
-        capacity, args.key_range, args.n_ops,
+        capacity, args.n_ops,
         args.block_size, args.warmups, args.reps, args.seed, args.tag.c_str());
 
-    // --- input buffer (cuRAND fills on GPU in setup; not part of timing) ---
-    // Each rep advances the generator, so the 16 reps see iid Uniform
-    // key streams rather than 16 timings of one frozen input.
-    std::uint32_t* d_keys = nullptr;
-    cudaMalloc(&d_keys, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
+    // --- input buffers ---
+    // d_keys: refreshed per rep in setup via cuRAND (cheap, gives iid
+    //   input draws across reps).
+    // d_values: zeroed once below. Under replace_op the value content
+    //   doesn't affect work; we only need the buffer present so the
+    //   timed kernel pays the input read.
+    std::uint32_t* d_keys   = nullptr;
+    std::uint32_t* d_values = nullptr;
+    cudaMalloc(&d_keys,   args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
+    cudaMalloc(&d_values, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
+    cudaMemset(d_values, 0, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
     UniformKeyGenerator gen(args.seed);
 
     const auto shape = compute_launch_shape(args.block_size, Table::tile_size);
 
     Recorder rec(args.output_dir / "insert.csv",
-        "library,workload,tag,rep,seed,capacity,key_range,n_ops,block_size,"
+        "library,workload,tag,rep,seed,capacity,n_ops,block_size,"
         "slot_bytes,bytes_per_op,time_ms");
 
     EventTimer timer;
@@ -161,20 +176,21 @@ int main(int argc, char** argv) {
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
             table.clear();
-            fill_uniform_keys(d_keys, args.n_ops, key_range, gen);
+            fill_uniform_keys(d_keys, args.n_ops, gen);
         },
         /*launch=*/ [&]() {
             insert<<<shape.grid_size, args.block_size>>>(
-                table.view(), d_keys, args.n_ops);
+                table.view(), d_keys, d_values, args.n_ops);
             cudaGetLastError() >> CUDA_CHECK;
         },
         /*after=*/  [&](int rep, float ms) {
             rec.write_row(format_row(
-                capacity, args.key_range, args.n_ops,
+                capacity, args.n_ops,
                 args.block_size, slot_bytes, bytes_per_op,
                 args.seed, rep, args.tag, ms));
         });
 
     cudaFree(d_keys);
+    cudaFree(d_values);
     return 0;
 }

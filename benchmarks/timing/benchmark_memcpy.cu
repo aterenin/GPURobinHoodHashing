@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     // doesn't accidentally measure a zero-page fast path.
     {
         UniformKeyGenerator gen(args.seed);
-        fill_uniform_keys(d_src, n_u32, std::uint32_t{1} << 31, gen);
+        fill_uniform_keys(d_src, n_u32, gen);
     }
     cudaMemset(d_dst, 0, bytes) >> CUDA_CHECK;
     cudaDeviceSynchronize() >> CUDA_CHECK;

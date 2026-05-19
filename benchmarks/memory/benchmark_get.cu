@@ -39,7 +39,6 @@ namespace {
 
 struct Args {
     std::size_t   capacity   = std::size_t{1} << 27;
-    std::size_t   key_range  = std::size_t{1} << 27;
     std::size_t   n_ops      = std::size_t{1} << 27;
     int           block_size = 256;
     int           warmups    = 2;
@@ -53,7 +52,6 @@ Args parse_args(int argc, char** argv) {
     Args a;
     ArgParser p(argv[0]);
     p.add("--capacity",   a.capacity,   "Table size in slots")
-     .add("--key-range",  a.key_range,  "N in Uniform(0, N) for key generation")
      .add("--n-ops",      a.n_ops,      "Number of get attempts (also pre-fill count)")
      .add("--block-size", a.block_size, "Threads per CUDA block; multiple of tile_size")
      .add("--warmups",    a.warmups,    "Untimed warmup reps")
@@ -64,8 +62,7 @@ Args parse_args(int argc, char** argv) {
     p.parse(argc, argv);
 
     if (a.output_dir.empty())                     p.print_usage();
-    if (a.n_ops == 0)                             { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
-    if (a.key_range == 0)                         { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
+    if (a.n_ops == 0)                             { std::fprintf(stderr, "--n-ops must be > 0\n"); std::exit(1); }
     if (a.block_size % Table::tile_size != 0)     { std::fprintf(stderr, "--block-size must be a multiple of tile_size (%d)\n", Table::tile_size); std::exit(1); }
     if (a.block_size <= 0 || a.block_size > 1024) { std::fprintf(stderr, "--block-size out of range\n"); std::exit(1); }
     return a;
@@ -130,7 +127,7 @@ __global__ void get(
 }
 
 std::string format_row(
-    std::size_t capacity, std::size_t key_range, std::size_t n_ops,
+    std::size_t capacity, std::size_t n_ops,
     int block_size, std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
     float time_ms,
@@ -143,7 +140,6 @@ std::string format_row(
       << rep           << ","
       << seed          << ","
       << capacity      << ","
-      << key_range     << ","
       << n_ops         << ","
       << block_size    << ","
       << slot_bytes    << ","
@@ -165,12 +161,11 @@ int main(int argc, char** argv) {
 
     Table table(args.capacity);
     const std::size_t capacity = table.capacity();
-    const std::uint32_t key_range = static_cast<std::uint32_t>(args.key_range);
 
     std::fprintf(stderr,
-        "[memory get] capacity=%zu key_range=%zu n_ops=%zu "
+        "[memory get] capacity=%zu n_ops=%zu "
         "block_size=%d warmups=%d reps=%d seed=%u tag=\"%s\"\n",
-        capacity, args.key_range, args.n_ops,
+        capacity, args.n_ops,
         args.block_size, args.warmups, args.reps,
         args.seed, args.tag.c_str());
 
@@ -181,7 +176,7 @@ int main(int argc, char** argv) {
     // --- pre-fill (untimed) ---
     std::uint32_t* d_insert_keys = nullptr;
     cudaMalloc(&d_insert_keys, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
-    fill_uniform_keys(d_insert_keys, args.n_ops, key_range, gen);
+    fill_uniform_keys(d_insert_keys, args.n_ops, gen);
 
     const auto shape = compute_launch_shape(args.block_size, Table::tile_size);
     const std::size_t n_tiles = shape.n_tiles;
@@ -207,7 +202,7 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> h_hits  (n_tiles);
 
     Recorder rec(args.output_dir / "get.csv",
-        "library,workload,tag,rep,seed,capacity,key_range,"
+        "library,workload,tag,rep,seed,capacity,"
         "n_ops,block_size,slot_bytes,bytes_per_op,time_ms,"
         "total_probes,total_hits,total_misses");
 
@@ -215,7 +210,7 @@ int main(int argc, char** argv) {
 
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
-            fill_uniform_keys(d_get_keys, args.n_ops, key_range, gen);
+            fill_uniform_keys(d_get_keys, args.n_ops, gen);
             cudaMemset(d_probes, 0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
             cudaMemset(d_hits,   0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
         },
@@ -239,7 +234,7 @@ int main(int argc, char** argv) {
             const std::uint64_t total_misses =
                 std::uint64_t{args.n_ops} - total_hits;
             rec.write_row(format_row(
-                capacity, args.key_range, args.n_ops,
+                capacity, args.n_ops,
                 args.block_size, slot_bytes, bytes_per_op,
                 args.seed, rep, args.tag,
                 ms, total_probes, total_hits, total_misses));
