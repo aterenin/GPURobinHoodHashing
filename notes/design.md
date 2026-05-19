@@ -404,6 +404,6 @@ At low F the two converge (avg probe length ≈ 1). At high F the corrected numb
 ## Future work
 
 - Validate the 128-bit slot path on a Hopper (sm_90+) system; benchmark it against the 64-bit path.
-- Benchmark against `cuCollections` and `WarpCore` on the same workloads to validate the bandwidth-bound claim.
+- Benchmark against `cuCollections` and `WarpCore` on the same workloads to validate the bandwidth-bound claim. Pinned commits for both live in `external/versions.txt`; the libraries themselves are vendored locally (gitignored) so downstream users of `gpurhh` aren't forced to pull them in.
 - Add a CPU reference Robin Hood for randomized differential testing if test signal demands it (currently considered low priority — the invariant scanner plus the sum-reduction equivalence check cover most of what differential testing would add).
 - Implement deletion (backward-shift, lock-free) if a use case appears.

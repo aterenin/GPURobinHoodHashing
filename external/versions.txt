@@ -1,0 +1,16 @@
+# Pinned commits for external benchmark baselines.
+#
+# external/ itself is gitignored apart from this manifest; the listed
+# libraries are vendored locally on the developer's machine for the
+# benchmark comparison and never tracked in the parent repo.
+#
+# To reproduce a baseline benchmark run, clone each library into the
+# named directory and `git checkout` the listed commit, e.g.:
+#
+#     git clone <url> external/<name>
+#     git -C external/<name> checkout <commit>
+#
+# Format: <name> <url> <pinned commit>
+
+cuCollections https://github.com/NVIDIA/cuCollections.git d4e84ee20b9185a3aa279ce184416bd41e53287f
+warpcore      https://github.com/sleeepyjack/warpcore.git  1a2fe03d438e8dfa1dbd8d9da73f183bd2d72051
