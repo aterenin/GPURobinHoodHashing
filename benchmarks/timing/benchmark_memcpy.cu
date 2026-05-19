@@ -7,7 +7,7 @@
 // of payload (one read plus one write). Used as a peak-bandwidth
 // reference line for the insert / get benchmarks.
 
-#include "benchmarks.cuh"
+#include "../benchmarks.cuh"
 
 #include <cuda_runtime.h>
 
@@ -30,39 +30,18 @@ struct Args {
     std::filesystem::path output_dir;
 };
 
-[[noreturn]] void die_usage(const char* prog) {
-    std::fprintf(stderr,
-        "usage: %s --output-dir DIR [options]\n"
-        "  --bytes N         Buffer size in bytes (default 1<<30; rounded down to 16 B)\n"
-        "  --warmups N       Untimed warmup runs per workload (default 2)\n"
-        "  --reps N          Timed runs per workload (default 16)\n"
-        "  --seed N          PRNG seed for the source buffer fill (default 42)\n"
-        "  --tag STR         Free-form label written to every CSV row\n"
-        "  --output-dir DIR  Required. memcpy.csv is appended to here.\n",
-        prog);
-    std::exit(1);
-}
-
 Args parse_args(int argc, char** argv) {
     Args a;
-    for (int i = 1; i < argc; ++i) {
-        std::string flag = argv[i];
-        auto get_val = [&]() -> std::string {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "Missing value for %s\n", flag.c_str());
-                die_usage(argv[0]);
-            }
-            return argv[++i];
-        };
-        if      (flag == "--bytes")      a.bytes      = std::stoull(get_val());
-        else if (flag == "--warmups")    a.warmups    = std::stoi(get_val());
-        else if (flag == "--reps")       a.reps       = std::stoi(get_val());
-        else if (flag == "--seed")       a.seed       = static_cast<std::uint32_t>(std::stoul(get_val()));
-        else if (flag == "--tag")        a.tag        = get_val();
-        else if (flag == "--output-dir") a.output_dir = get_val();
-        else { std::fprintf(stderr, "Unknown flag: %s\n", flag.c_str()); die_usage(argv[0]); }
-    }
-    if (a.output_dir.empty()) die_usage(argv[0]);
+    ArgParser p(argv[0]);
+    p.add("--bytes",      a.bytes,      "Buffer size in bytes (rounded down to 16 B)")
+     .add("--warmups",    a.warmups,    "Untimed warmup runs per workload")
+     .add("--reps",       a.reps,       "Timed runs per workload")
+     .add("--seed",       a.seed,       "cuRAND seed for the source buffer fill")
+     .add("--tag",        a.tag,        "Free-form label written to every CSV row")
+     .add("--output-dir", a.output_dir, "Required. memcpy.csv is appended to here.");
+    p.parse(argc, argv);
+
+    if (a.output_dir.empty()) p.print_usage();
     a.bytes -= a.bytes % sizeof(uint4);  // round down for vectorized copy
     if (a.bytes == 0) {
         std::fprintf(stderr, "--bytes must be at least %zu\n", sizeof(uint4));

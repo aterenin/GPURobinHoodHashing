@@ -1,26 +1,18 @@
-// Insert benchmark for gpurhh — comparison version.
+// Insert benchmark for gpurhh — memory-utilization study.
 //
-// Apples-to-apples with the cuco / warpcore baselines:
-//   - Reduction operator: replace_op (no extra work on duplicate keys).
-//   - MaxProbeBuckets: 1 << 20 (effectively uncapped, matching the
-//     baselines' unbounded probe semantics).
-//   - No counter instrumentation in the hot path.
+// Studies gpurhh's design in its full configuration:
+//   - Reduction operator: sum_op (exercise the reduction path).
+//   - MaxProbeBuckets: 8 (the default — study the probe-cap regime).
+//   - Per-tile probe / failure counters via GPURHH_BENCHMARK_COUNTERS.
 //
-// Workload:
-//   - Key type uint32_t, value type uint32_t.
-//   - Keys drawn from Uniform(0, key_range) at runtime.
-//   - Single ~1 GiB table by default, DRAM-resident.
-//
-// Per timed sample:
-//   1. Empty the table via table.clear() (untimed).
-//   2. Time one kernel that processes n_ops insert ops in a grid-stride loop.
-//   3. Emit a CSV row recording the raw configuration + measured time.
-//
-// All derived metrics (ops_per_sec, gbps_floor, load_factor, occupancy,
-// hit_rate, ...) are computed in the analysis script from the raw
-// CSV columns, not in this binary.
+// Writes insert.csv with the same configuration columns as the timing
+// build plus total_probes and total_failures. Lives under memory/ to
+// distinguish it from benchmarks/timing/benchmark_insert.cu, which is
+// the apples-to-apples comparison build.
 
-#include "benchmarks.cuh"
+#define GPURHH_BENCHMARK_COUNTERS 1
+
+#include "../benchmarks.cuh"
 
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
@@ -30,8 +22,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <numeric>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace cg = cooperative_groups;
 
@@ -40,16 +34,13 @@ using Table = gpurhh::HashTable<
     std::uint32_t,
     gpurhh::default_hash<std::uint32_t>,
     gpurhh::default_empty_key<std::uint32_t>::key,
-    gpurhh::replace_op,
-    /*CacheLineBytes=*/128,
-    /*WarpSize=*/32,
-    /*MaxProbeBuckets=*/(1 << 20)>;
+    gpurhh::sum_op>;
 using View = Table::View;
 
 namespace {
 
 struct Args {
-    std::size_t   capacity   = std::size_t{1} << 27;  // 1 GiB at 8 B/slot
+    std::size_t   capacity   = std::size_t{1} << 27;
     std::size_t   key_range  = std::size_t{1} << 27;
     std::size_t   n_ops      = std::size_t{1} << 27;
     int           block_size = 256;
@@ -60,45 +51,21 @@ struct Args {
     std::filesystem::path output_dir;
 };
 
-[[noreturn]] void die_usage(const char* prog) {
-    std::fprintf(stderr,
-        "usage: %s --output-dir DIR [options]\n"
-        "  --capacity N       Table size in slots (default 1<<27; rounded up to next pow2).\n"
-        "  --key-range N      N in Uniform(0, N) used for key generation (default 1<<27).\n"
-        "  --n-ops N          Number of insert attempts (default 1<<27).\n"
-        "  --block-size N     Threads per CUDA block; multiple of tile_size (default 256).\n"
-        "  --warmups N        Untimed warmup reps (default 2).\n"
-        "  --reps N           Timed reps (default 16).\n"
-        "  --seed N           PRNG seed for key generation (default 42).\n"
-        "  --tag STR          Free-form label written to every CSV row.\n"
-        "  --output-dir DIR   Required. insert.csv is appended to here.\n",
-        prog);
-    std::exit(1);
-}
-
 Args parse_args(int argc, char** argv) {
     Args a;
-    for (int i = 1; i < argc; ++i) {
-        std::string flag = argv[i];
-        auto get_val = [&]() -> std::string {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "Missing value for %s\n", flag.c_str());
-                die_usage(argv[0]);
-            }
-            return argv[++i];
-        };
-        if      (flag == "--capacity")   a.capacity   = std::stoull(get_val());
-        else if (flag == "--key-range")  a.key_range  = std::stoull(get_val());
-        else if (flag == "--n-ops")      a.n_ops      = std::stoull(get_val());
-        else if (flag == "--block-size") a.block_size = std::stoi(get_val());
-        else if (flag == "--warmups")    a.warmups    = std::stoi(get_val());
-        else if (flag == "--reps")       a.reps       = std::stoi(get_val());
-        else if (flag == "--seed")       a.seed       = static_cast<std::uint32_t>(std::stoul(get_val()));
-        else if (flag == "--tag")        a.tag        = get_val();
-        else if (flag == "--output-dir") a.output_dir = get_val();
-        else { std::fprintf(stderr, "Unknown flag: %s\n", flag.c_str()); die_usage(argv[0]); }
-    }
-    if (a.output_dir.empty())                     die_usage(argv[0]);
+    ArgParser p(argv[0]);
+    p.add("--capacity",   a.capacity,   "Table size in slots")
+     .add("--key-range",  a.key_range,  "N in Uniform(0, N) for key generation")
+     .add("--n-ops",      a.n_ops,      "Number of insert attempts")
+     .add("--block-size", a.block_size, "Threads per CUDA block; multiple of tile_size")
+     .add("--warmups",    a.warmups,    "Untimed warmup reps")
+     .add("--reps",       a.reps,       "Timed reps")
+     .add("--seed",       a.seed,       "cuRAND seed for key generation")
+     .add("--tag",        a.tag,        "Free-form label written to every CSV row")
+     .add("--output-dir", a.output_dir, "Required. insert.csv is appended to here.");
+    p.parse(argc, argv);
+
+    if (a.output_dir.empty())                     p.print_usage();
     if (a.n_ops == 0)                             { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
     if (a.key_range == 0)                         { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
     if (a.block_size % Table::tile_size != 0)     { std::fprintf(stderr, "--block-size must be a multiple of tile_size (%d)\n", Table::tile_size); std::exit(1); }
@@ -109,7 +76,9 @@ Args parse_args(int argc, char** argv) {
 __global__ void insert(
     View view,
     const std::uint32_t* __restrict__ keys,
-    std::size_t n_ops)
+    std::size_t n_ops,
+    std::uint32_t* __restrict__ per_tile_probes,
+    std::uint32_t* __restrict__ per_tile_failures)
 {
     auto block = cg::this_thread_block();
     auto tile  = cg::tiled_partition<Table::tile_size>(block);
@@ -120,10 +89,21 @@ __global__ void insert(
     const std::size_t total_tiles =
         std::size_t{gridDim.x} * tiles_per_block;
 
+    std::uint32_t my_probes   = 0;
+    std::uint32_t my_failures = 0;
+
     for (std::size_t op_id = tile_id; op_id < n_ops; op_id += total_tiles) {
         const std::uint32_t k = keys[op_id];
         const std::uint32_t v = gpurhh::detail::fmix32(k);
-        (void) view.insert(tile, k, v);
+        const auto leftover = view.insert(tile, k, v, my_probes);
+        if (leftover.has_value() && tile.thread_rank() == 0) {
+            ++my_failures;
+        }
+    }
+
+    if (tile.thread_rank() == 0) {
+        per_tile_probes  [tile_id] = my_probes;
+        per_tile_failures[tile_id] = my_failures;
     }
 }
 
@@ -131,7 +111,7 @@ std::string format_row(
     std::size_t capacity, std::size_t key_range, std::size_t n_ops,
     int block_size, std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
-    float time_ms)
+    float time_ms, std::uint64_t total_probes, std::uint64_t total_failures)
 {
     std::ostringstream s;
     s.precision(9);
@@ -145,7 +125,9 @@ std::string format_row(
       << block_size    << ","
       << slot_bytes    << ","
       << bytes_per_op  << ","
-      << time_ms;
+      << time_ms       << ","
+      << total_probes  << ","
+      << total_failures;
     return s.str();
 }
 
@@ -162,23 +144,28 @@ int main(int argc, char** argv) {
     const std::uint32_t key_range = static_cast<std::uint32_t>(args.key_range);
 
     std::fprintf(stderr,
-        "[insert] capacity=%zu key_range=%zu n_ops=%zu "
+        "[memory insert] capacity=%zu key_range=%zu n_ops=%zu "
         "block_size=%d warmups=%d reps=%d seed=%u tag=\"%s\"\n",
         capacity, args.key_range, args.n_ops,
         args.block_size, args.warmups, args.reps, args.seed, args.tag.c_str());
 
-    // --- input buffer (cuRAND fills on GPU in setup; not part of timing) ---
-    // Each rep advances the generator, so the 16 reps see iid Uniform
-    // key streams rather than 16 timings of one frozen input.
     std::uint32_t* d_keys = nullptr;
     cudaMalloc(&d_keys, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
     UniformKeyGenerator gen(args.seed);
 
     const auto shape = compute_launch_shape(args.block_size, Table::tile_size);
+    const std::size_t n_tiles = shape.n_tiles;
+
+    std::uint32_t* d_probes   = nullptr;
+    std::uint32_t* d_failures = nullptr;
+    cudaMalloc(&d_probes,   n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+    cudaMalloc(&d_failures, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+    std::vector<std::uint32_t> h_probes  (n_tiles);
+    std::vector<std::uint32_t> h_failures(n_tiles);
 
     Recorder rec(args.output_dir / "insert.csv",
         "library,workload,tag,rep,seed,capacity,key_range,n_ops,block_size,"
-        "slot_bytes,bytes_per_op,time_ms");
+        "slot_bytes,bytes_per_op,time_ms,total_probes,total_failures");
 
     EventTimer timer;
 
@@ -186,19 +173,34 @@ int main(int argc, char** argv) {
         /*setup=*/  [&]() {
             table.clear();
             fill_uniform_keys(d_keys, args.n_ops, key_range, gen);
+            cudaMemset(d_probes,   0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+            cudaMemset(d_failures, 0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
         },
         /*launch=*/ [&]() {
             insert<<<shape.grid_size, args.block_size>>>(
-                table.view(), d_keys, args.n_ops);
+                table.view(), d_keys, args.n_ops, d_probes, d_failures);
             cudaGetLastError() >> CUDA_CHECK;
         },
         /*after=*/  [&](int rep, float ms) {
+            cudaMemcpy(h_probes.data(),   d_probes,
+                       n_tiles * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+            cudaMemcpy(h_failures.data(), d_failures,
+                       n_tiles * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+            const std::uint64_t total_probes =
+                std::accumulate(h_probes.begin(), h_probes.end(), std::uint64_t{0});
+            const std::uint64_t total_failures =
+                std::accumulate(h_failures.begin(), h_failures.end(), std::uint64_t{0});
             rec.write_row(format_row(
                 capacity, args.key_range, args.n_ops,
                 args.block_size, slot_bytes, bytes_per_op,
-                args.seed, rep, args.tag, ms));
+                args.seed, rep, args.tag,
+                ms, total_probes, total_failures));
         });
 
     cudaFree(d_keys);
+    cudaFree(d_probes);
+    cudaFree(d_failures);
     return 0;
 }

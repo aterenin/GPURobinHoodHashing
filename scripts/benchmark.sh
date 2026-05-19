@@ -1,61 +1,64 @@
 #!/usr/bin/env bash
 #
-# Run the gpurhh benchmark sweep, optionally followed by the external
-# baseline sweeps (cuCollections, WarpCore).
+# Run the gpurhh benchmark sweeps and optional external baselines.
 #
-# Writes per-workload CSV files (memcpy.csv, insert.csv, get.csv) and
-# their counter-instrumented siblings (insert_counters.csv,
-# get_counters.csv) plus a run_info.txt sidecar and a benchmark.log
-# transcript to the output directory. The output dir defaults to
+# The benchmark suite is split into two studies, each writing its own
+# CSV directory tree under the output dir:
+#
+#   timing/   apples-to-apples kernel throughput (memcpy.csv, insert.csv,
+#             get.csv). gpurhh + optional cuco / warpcore baselines all
+#             append to the same per-workload CSV; the `library` column
+#             distinguishes their rows.
+#
+#   memory/   gpurhh's counter-instrumented probe / failure / hit study
+#             (insert.csv, get.csv with extra count columns). No
+#             baselines — cuco / warpcore don't expose these counters.
+#
+# Also written: benchmark.log (transcript) and run_info.txt (host info),
+# both at the top of the output dir. Output defaults to
 # output/<timestamp>/ under the repo root, so consecutive runs don't
 # collide.
 #
 # Usage:
-#     scripts/benchmark.sh <one-or-more-libraries> [output-dir]
+#     scripts/benchmark.sh <one-or-more-flags> [output-dir]
 #
-# Pick at least one library to run. Combining flags runs each
-# selected library's sweep in turn. Passing no flag prints this usage
-# and exits — no default, since benchmark runs are heavy.
+# Pick at least one flag. Passing none prints this usage and exits.
 #
-#   --gpurhh           Run the gpurhh comparison sweep (memcpy + insert + get).
-#   --gpurhh-counters  Run the gpurhh counter-instrumented sweep
-#                      (insert_counters + get_counters; produces probe
-#                      / failure / hit columns).
-#   --cuco             Run the cuCollections baseline.
-#   --warpcore         Run the WarpCore baseline.
-#   --all              Shortcut for every library whose binaries built;
-#                      missing baselines are skipped with a notice
-#                      rather than erroring.
+#   --timing     Run gpurhh's timing sweep (memcpy + insert + get).
+#   --memory     Run gpurhh's memory-utilization sweep
+#                (probe / failure / hit counters).
+#   --cuco       Run the cuCollections baseline (timing only).
+#   --warpcore   Run the WarpCore baseline (timing only).
+#   --all        Shortcut for every flag above; missing binaries are
+#                skipped with a notice rather than erroring.
 #
-# Library-specific flags are strict — they error if the corresponding
-# binaries weren't built. --all is lenient. Comparison rows from all
-# libraries land in the same insert.csv / get.csv; the `library` column
-# distinguishes them. Counter rows go to separate _counters.csv files.
+# Individual flags are strict — they error if the corresponding binaries
+# weren't built. --all is lenient.
 
 set -euo pipefail
 
 # --- argument parsing ------------------------------------------------------
 
 print_usage() {
-    sed -n '2,32p' "$0" | sed 's/^# //; s/^#//'
+    sed -n '2,38p' "$0" | sed 's/^# //; s/^#//'
 }
 
-RUN_GPURHH=0
-RUN_GPURHH_COUNTERS=0
+RUN_TIMING=0
+RUN_MEMORY=0
 RUN_CUCO=0
 RUN_WARPCORE=0
 LENIENT=0
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --gpurhh)           RUN_GPURHH=1;          shift ;;
-        --gpurhh-counters)  RUN_GPURHH_COUNTERS=1; shift ;;
-        --cuco)             RUN_CUCO=1;            shift ;;
-        --warpcore)         RUN_WARPCORE=1;        shift ;;
-        --all)              RUN_GPURHH=1; RUN_GPURHH_COUNTERS=1
-                            RUN_CUCO=1; RUN_WARPCORE=1
-                            LENIENT=1;             shift ;;
-        --help|-h)          print_usage; exit 0 ;;
+        --timing)    RUN_TIMING=1;   shift ;;
+        --memory)    RUN_MEMORY=1;   shift ;;
+        --cuco)      RUN_CUCO=1;     shift ;;
+        --warpcore)  RUN_WARPCORE=1; shift ;;
+        --all)       RUN_TIMING=1; RUN_MEMORY=1
+                     RUN_CUCO=1;   RUN_WARPCORE=1
+                     LENIENT=1;     shift ;;
+        --help|-h)   print_usage; exit 0 ;;
         --*)
             echo "Unknown flag: $1" >&2
             echo "Try '$0 --help' for usage." >&2
@@ -66,20 +69,26 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${POSITIONAL[@]}"
 
-if [[ $((RUN_GPURHH + RUN_GPURHH_COUNTERS + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
+if [[ $((RUN_TIMING + RUN_MEMORY + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
     print_usage >&2
     exit 1
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/build/benchmarks"
+TIMING_BIN="${BUILD_DIR}/timing"
+MEMORY_BIN="${BUILD_DIR}/memory"
+CUCO_BIN="${TIMING_BIN}/baselines/cuco"
+WARPCORE_BIN="${TIMING_BIN}/baselines/warpcore"
 
 if [[ $# -ge 1 ]]; then
     OUTPUT_DIR="$1"
 else
     OUTPUT_DIR="${REPO_ROOT}/output/$(date +%Y-%m-%d_%H-%M-%S)"
 fi
-mkdir -p "${OUTPUT_DIR}"
+TIMING_OUT="${OUTPUT_DIR}/timing"
+MEMORY_OUT="${OUTPUT_DIR}/memory"
+mkdir -p "${OUTPUT_DIR}" "${TIMING_OUT}" "${MEMORY_OUT}"
 
 LOG_FILE="${OUTPUT_DIR}/benchmark.log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -100,33 +109,33 @@ require_or_drop() {
     return 0
 }
 
-if [[ "${RUN_GPURHH}" -eq 1 ]]; then
-    require_or_drop "gpurhh" \
-        "${BUILD_DIR}/benchmark_memcpy" \
-        "${BUILD_DIR}/benchmark_insert" \
-        "${BUILD_DIR}/benchmark_get" \
-        || RUN_GPURHH=0
+if [[ "${RUN_TIMING}" -eq 1 ]]; then
+    require_or_drop "timing" \
+        "${TIMING_BIN}/benchmark_memcpy" \
+        "${TIMING_BIN}/benchmark_insert" \
+        "${TIMING_BIN}/benchmark_get" \
+        || RUN_TIMING=0
 fi
-if [[ "${RUN_GPURHH_COUNTERS}" -eq 1 ]]; then
-    require_or_drop "gpurhh-counters" \
-        "${BUILD_DIR}/benchmark_insert_counters" \
-        "${BUILD_DIR}/benchmark_get_counters" \
-        || RUN_GPURHH_COUNTERS=0
+if [[ "${RUN_MEMORY}" -eq 1 ]]; then
+    require_or_drop "memory" \
+        "${MEMORY_BIN}/benchmark_insert" \
+        "${MEMORY_BIN}/benchmark_get" \
+        || RUN_MEMORY=0
 fi
 if [[ "${RUN_CUCO}" -eq 1 ]]; then
     require_or_drop "cuco" \
-        "${BUILD_DIR}/baselines/cuco/benchmark_insert" \
-        "${BUILD_DIR}/baselines/cuco/benchmark_get" \
+        "${CUCO_BIN}/benchmark_insert" \
+        "${CUCO_BIN}/benchmark_get" \
         || RUN_CUCO=0
 fi
 if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
     require_or_drop "warpcore" \
-        "${BUILD_DIR}/baselines/warpcore/benchmark_insert" \
-        "${BUILD_DIR}/baselines/warpcore/benchmark_get" \
+        "${WARPCORE_BIN}/benchmark_insert" \
+        "${WARPCORE_BIN}/benchmark_get" \
         || RUN_WARPCORE=0
 fi
 
-if [[ $((RUN_GPURHH + RUN_GPURHH_COUNTERS + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
+if [[ $((RUN_TIMING + RUN_MEMORY + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
     echo "Nothing to run." >&2
     exit 1
 fi
@@ -173,12 +182,12 @@ for mul in 0.5 0.7 0.85 0.95; do
     BASELINE_NOPS+=($(python3 -c "print(int($mul * $CAPACITY))"))
 done
 
-# --- gpurhh comparison (memcpy + insert + get sweeps) --------------------
-if [[ "${RUN_GPURHH}" -eq 1 ]]; then
+# --- timing sweep (memcpy + insert + get for gpurhh) ---------------------
+if [[ "${RUN_TIMING}" -eq 1 ]]; then
     BYTES=$(( CAPACITY * SLOT_BYTES ))
     echo "==> memcpy baseline (${BYTES} B)"
-    "${BUILD_DIR}/benchmark_memcpy" \
-        --output-dir "${OUTPUT_DIR}" \
+    "${TIMING_BIN}/benchmark_memcpy" \
+        --output-dir "${TIMING_OUT}" \
         --bytes "${BYTES}" \
         --reps "${REPS}" \
         --seed "${SEED}" \
@@ -186,9 +195,9 @@ if [[ "${RUN_GPURHH}" -eq 1 ]]; then
 
     for n_ops in "${GPURHH_NOPS[@]}"; do
         for b in "${BLOCK_SIZES[@]}"; do
-            echo "==> gpurhh insert n_ops=${n_ops} block=${b}"
-            "${BUILD_DIR}/benchmark_insert" \
-                --output-dir "${OUTPUT_DIR}" \
+            echo "==> timing insert n_ops=${n_ops} block=${b}"
+            "${TIMING_BIN}/benchmark_insert" \
+                --output-dir "${TIMING_OUT}" \
                 --capacity "${CAPACITY}" \
                 --key-range "${KEY_RANGE}" \
                 --n-ops "${n_ops}" \
@@ -197,9 +206,9 @@ if [[ "${RUN_GPURHH}" -eq 1 ]]; then
                 --seed "${SEED}" \
                 --tag "${TAG}"
 
-            echo "==> gpurhh get    n_ops=${n_ops} block=${b}"
-            "${BUILD_DIR}/benchmark_get" \
-                --output-dir "${OUTPUT_DIR}" \
+            echo "==> timing get    n_ops=${n_ops} block=${b}"
+            "${TIMING_BIN}/benchmark_get" \
+                --output-dir "${TIMING_OUT}" \
                 --capacity "${CAPACITY}" \
                 --key-range "${KEY_RANGE}" \
                 --n-ops "${n_ops}" \
@@ -211,13 +220,13 @@ if [[ "${RUN_GPURHH}" -eq 1 ]]; then
     done
 fi
 
-# --- gpurhh counters (study the design with instrumentation on) ----------
-if [[ "${RUN_GPURHH_COUNTERS}" -eq 1 ]]; then
+# --- memory sweep (counter-instrumented gpurhh study) --------------------
+if [[ "${RUN_MEMORY}" -eq 1 ]]; then
     for n_ops in "${GPURHH_NOPS[@]}"; do
         for b in "${BLOCK_SIZES[@]}"; do
-            echo "==> gpurhh insert_counters n_ops=${n_ops} block=${b}"
-            "${BUILD_DIR}/benchmark_insert_counters" \
-                --output-dir "${OUTPUT_DIR}" \
+            echo "==> memory insert n_ops=${n_ops} block=${b}"
+            "${MEMORY_BIN}/benchmark_insert" \
+                --output-dir "${MEMORY_OUT}" \
                 --capacity "${CAPACITY}" \
                 --key-range "${KEY_RANGE}" \
                 --n-ops "${n_ops}" \
@@ -226,9 +235,9 @@ if [[ "${RUN_GPURHH_COUNTERS}" -eq 1 ]]; then
                 --seed "${SEED}" \
                 --tag "${TAG}"
 
-            echo "==> gpurhh get_counters    n_ops=${n_ops} block=${b}"
-            "${BUILD_DIR}/benchmark_get_counters" \
-                --output-dir "${OUTPUT_DIR}" \
+            echo "==> memory get    n_ops=${n_ops} block=${b}"
+            "${MEMORY_BIN}/benchmark_get" \
+                --output-dir "${MEMORY_OUT}" \
                 --capacity "${CAPACITY}" \
                 --key-range "${KEY_RANGE}" \
                 --n-ops "${n_ops}" \
@@ -240,13 +249,12 @@ if [[ "${RUN_GPURHH_COUNTERS}" -eq 1 ]]; then
     done
 fi
 
-# --- cuCollections (fixed-capacity static_map; no block sweep) -----------
+# --- cuCollections baseline (timing only) --------------------------------
 if [[ "${RUN_CUCO}" -eq 1 ]]; then
-    CUCO_DIR="${BUILD_DIR}/baselines/cuco"
     for n_ops in "${BASELINE_NOPS[@]}"; do
         echo "==> cuco insert n_ops=${n_ops}"
-        "${CUCO_DIR}/benchmark_insert" \
-            --output-dir "${OUTPUT_DIR}" \
+        "${CUCO_BIN}/benchmark_insert" \
+            --output-dir "${TIMING_OUT}" \
             --capacity "${CAPACITY}" \
             --key-range "${KEY_RANGE}" \
             --n-ops "${n_ops}" \
@@ -255,8 +263,8 @@ if [[ "${RUN_CUCO}" -eq 1 ]]; then
             --tag "${TAG}"
 
         echo "==> cuco get    n_ops=${n_ops}"
-        "${CUCO_DIR}/benchmark_get" \
-            --output-dir "${OUTPUT_DIR}" \
+        "${CUCO_BIN}/benchmark_get" \
+            --output-dir "${TIMING_OUT}" \
             --capacity "${CAPACITY}" \
             --key-range "${KEY_RANGE}" \
             --n-ops "${n_ops}" \
@@ -266,13 +274,12 @@ if [[ "${RUN_CUCO}" -eq 1 ]]; then
     done
 fi
 
-# --- WarpCore -----------------------------------------------------------
+# --- WarpCore baseline (timing only) ------------------------------------
 if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
-    WARPCORE_DIR="${BUILD_DIR}/baselines/warpcore"
     for n_ops in "${BASELINE_NOPS[@]}"; do
         echo "==> warpcore insert n_ops=${n_ops}"
-        "${WARPCORE_DIR}/benchmark_insert" \
-            --output-dir "${OUTPUT_DIR}" \
+        "${WARPCORE_BIN}/benchmark_insert" \
+            --output-dir "${TIMING_OUT}" \
             --capacity "${CAPACITY}" \
             --key-range "${KEY_RANGE}" \
             --n-ops "${n_ops}" \
@@ -281,8 +288,8 @@ if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
             --tag "${TAG}"
 
         echo "==> warpcore get    n_ops=${n_ops}"
-        "${WARPCORE_DIR}/benchmark_get" \
-            --output-dir "${OUTPUT_DIR}" \
+        "${WARPCORE_BIN}/benchmark_get" \
+            --output-dir "${TIMING_OUT}" \
             --capacity "${CAPACITY}" \
             --key-range "${KEY_RANGE}" \
             --n-ops "${n_ops}" \

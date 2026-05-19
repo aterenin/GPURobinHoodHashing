@@ -75,6 +75,24 @@ Storing it would cost bits we'd rather give to the payload, and the derivation i
 - Hash function is a template parameter; default is a finalizer-style mixer (e.g. the splitmix64/Murmur3 finalizer) that is cheap on GPU and decorrelates structured keys well.
 - Robin Hood tolerates higher load than linear probing, but on a GPU the warp tail-latency argument pushes us back toward 0.7–0.8 rather than 0.9.
 
+### Where the power-of-two assumption is load-bearing
+
+The "capacity is a power of two" constraint is not just a convenience — it's wired into multiple hot-path operations. Anyone touching these sites should know that breaking the invariant would require switching every `& mask` back to a `% capacity`, which is materially slower on GPU (multi-cycle integer divmod vs. a single AND).
+
+In `include/gpurhh/hash_table.cuh`:
+
+- **`HashTable` constructor**: `next_pow2(min_capacity)` rounds the user-supplied capacity up; `capacity_mask_ = capacity_ - 1` is cached for use across the hot paths. Capacity can grow by up to 2× over what the user asked for. The trade-off is a one-cycle mask vs. a multi-cycle modulus on every probe step.
+- **Home-slot computation** (insert and get): `home_slot = hash(key) & capacity_mask_` (and `home_bucket = home_slot / bucket_size`). Replacing `&` with `%` would also require capacity_mask_ to be replaced by the raw capacity, doubling the mod cost on every probe.
+- **Probe wrap-around**: `bucket_idx = (home_bucket + probe) & bucket_mask`, where `bucket_mask = num_buckets - 1`. Since `num_buckets = capacity / bucket_size` and both are powers of two, the bucket count is also pow-2 and admits a mask.
+- **Probe-distance derivation** (used inside the Robin Hood swap check): `resident_probe = (bucket_idx - resident_home) & bucket_mask` — this handles wrap-around correctly precisely because `bucket_mask = num_buckets - 1`.
+- **Tile size and warp size**: independently asserted pow-2 via `static_assert((tile_size & (tile_size - 1)) == 0, ...)`. Used by `tiles_per_block = block_size / tile_size` and by `cg::tiled_partition<tile_size>`, which itself requires a pow-2 tile size.
+
+In benchmarks (`benchmarks/benchmarks.cuh`):
+
+- **Key generation** (`map_to_range`): folds cuRAND bits to `[0, range)` via `x & (range - 1)` when range is a power of two, falling back to `x % range` otherwise. The sweep driver always uses `key_range = capacity`, so the mask path is taken in practice.
+
+A subtler dependency lives in the **default hash function**. With a pow-2 mask, only the low bits of `hash(key)` reach `capacity_mask_` — the high bits are thrown away. If a user supplied an identity hash on structured keys (e.g. dense integer IDs), low-bit clustering would map directly into slot clustering and probe lengths would explode. The default `default_hash<uint32_t>` is `fmix32`, a finalizer-style mixer that spreads bits well, so the low bits of `hash(k)` are pseudo-uniform even when keys are not. Users supplying their own `Hash` should preserve this property; passing a non-mixing hash with a pow-2 capacity is the textbook way to break a fast hash table.
+
 ## Reduction operators
 
 When `View::insert` encounters an existing entry for the same key, the new value is combined with the existing one through a `Reduction` functor — a template parameter of `HashTable`, defaulting to `gpurhh::replace_op`.

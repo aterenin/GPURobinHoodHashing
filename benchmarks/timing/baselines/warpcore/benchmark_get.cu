@@ -1,8 +1,6 @@
-// Insert benchmark against WarpCore's `SingleValueHashTable`.
-//
-// Apples-to-apples with benchmarks/benchmark_insert.cu's CSV schema.
+// Get benchmark against WarpCore's `SingleValueHashTable`.
 
-#include "../../benchmarks.cuh"
+#include "../../../benchmarks.cuh"
 
 #include <warpcore/single_value_hash_table.cuh>
 
@@ -33,33 +31,20 @@ struct Args {
     std::filesystem::path output_dir;
 };
 
-[[noreturn]] void die_usage(const char* prog) {
-    std::fprintf(stderr,
-        "usage: %s --output-dir DIR [options]\n"
-        "  --capacity N --key-range N --n-ops N --warmups N --reps N --seed N --tag STR\n",
-        prog);
-    std::exit(1);
-}
-
 Args parse_args(int argc, char** argv) {
     Args a;
-    for (int i = 1; i < argc; ++i) {
-        std::string flag = argv[i];
-        auto get_val = [&]() -> std::string {
-            if (i + 1 >= argc) { std::fprintf(stderr, "Missing value for %s\n", flag.c_str()); die_usage(argv[0]); }
-            return argv[++i];
-        };
-        if      (flag == "--capacity")   a.capacity   = std::stoull(get_val());
-        else if (flag == "--key-range")  a.key_range  = std::stoull(get_val());
-        else if (flag == "--n-ops")      a.n_ops      = std::stoull(get_val());
-        else if (flag == "--warmups")    a.warmups    = std::stoi(get_val());
-        else if (flag == "--reps")       a.reps       = std::stoi(get_val());
-        else if (flag == "--seed")       a.seed       = static_cast<std::uint32_t>(std::stoul(get_val()));
-        else if (flag == "--tag")        a.tag        = get_val();
-        else if (flag == "--output-dir") a.output_dir = get_val();
-        else { std::fprintf(stderr, "Unknown flag: %s\n", flag.c_str()); die_usage(argv[0]); }
-    }
-    if (a.output_dir.empty()) die_usage(argv[0]);
+    ArgParser p(argv[0]);
+    p.add("--capacity",   a.capacity,   "Table size in slots")
+     .add("--key-range",  a.key_range,  "N in Uniform(0, N) for key generation")
+     .add("--n-ops",      a.n_ops,      "Number of get attempts (also pre-fill count)")
+     .add("--warmups",    a.warmups,    "Untimed warmup reps")
+     .add("--reps",       a.reps,       "Timed reps")
+     .add("--seed",       a.seed,       "cuRAND seed; one stream produces insert then get keys")
+     .add("--tag",        a.tag,        "Free-form label written to every CSV row")
+     .add("--output-dir", a.output_dir, "Required. get.csv is appended to here.");
+    p.parse(argc, argv);
+
+    if (a.output_dir.empty()) p.print_usage();
     if (a.n_ops == 0)         { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
     if (a.key_range == 0)     { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
     return a;
@@ -73,7 +58,7 @@ std::string format_row(
 {
     std::ostringstream s;
     s.precision(9);
-    s << "warpcore,insert,"
+    s << "warpcore,get,"
       << tag          << ","
       << rep          << ","
       << seed         << ","
@@ -105,37 +90,55 @@ int main(int argc, char** argv) {
     const Key key_range = static_cast<Key>(args.key_range);
 
     std::fprintf(stderr,
-        "[warpcore insert] capacity=%zu key_range=%zu n_ops=%zu "
+        "[warpcore get] capacity=%zu key_range=%zu n_ops=%zu "
         "warmups=%d reps=%d seed=%u tag=\"%s\"\n",
         args.capacity, args.key_range, args.n_ops,
         args.warmups, args.reps, args.seed, args.tag.c_str());
 
-    Key*   d_keys   = nullptr;
-    Value* d_values = nullptr;
-    cudaMalloc(&d_keys,   args.n_ops * sizeof(Key))   >> CUDA_CHECK;
-    cudaMalloc(&d_values, args.n_ops * sizeof(Value)) >> CUDA_CHECK;
+    // Single cuRAND generator, sequential disjoint streams: first n_ops
+    // draws → insert keys, next n_ops draws → get keys.
     UniformKeyGenerator gen(args.seed);
 
-    constexpr int fill_block = 256;
-    const int fill_grid =
-        static_cast<int>((args.n_ops + fill_block - 1) / fill_block);
+    // Pre-fill.
+    Key*   d_insert_keys   = nullptr;
+    Value* d_insert_values = nullptr;
+    cudaMalloc(&d_insert_keys,   args.n_ops * sizeof(Key))   >> CUDA_CHECK;
+    cudaMalloc(&d_insert_values, args.n_ops * sizeof(Value)) >> CUDA_CHECK;
+    fill_uniform_keys(d_insert_keys, args.n_ops, key_range, gen);
+    {
+        constexpr int fill_block = 256;
+        const int fill_grid =
+            static_cast<int>((args.n_ops + fill_block - 1) / fill_block);
+        derive_values<<<fill_grid, fill_block>>>(d_insert_keys, d_insert_values, args.n_ops);
+        cudaGetLastError() >> CUDA_CHECK;
+    }
 
     Table table(args.capacity);
+    table.insert(d_insert_keys, d_insert_values, args.n_ops);
+    cudaDeviceSynchronize() >> CUDA_CHECK;
+    cudaFree(d_insert_keys);
+    cudaFree(d_insert_values);
 
-    Recorder rec(args.output_dir / "insert.csv",
-        "library,workload,tag,rep,seed,capacity,key_range,n_ops,block_size,"
-        "slot_bytes,bytes_per_op,time_ms");
+    // Get keys (continuation of the same generator; refilled per rep).
+    Key* d_get_keys = nullptr;
+    cudaMalloc(&d_get_keys, args.n_ops * sizeof(Key)) >> CUDA_CHECK;
+
+    Value* d_out = nullptr;
+    cudaMalloc(&d_out, args.n_ops * sizeof(Value)) >> CUDA_CHECK;
+
+    Recorder rec(args.output_dir / "get.csv",
+        "library,workload,tag,rep,seed,capacity,key_range,"
+        "n_ops,block_size,slot_bytes,bytes_per_op,time_ms");
 
     EventTimer timer;
 
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
-            table.init();
-            fill_uniform_keys(d_keys, args.n_ops, key_range, gen);
-            derive_values<<<fill_grid, fill_block>>>(d_keys, d_values, args.n_ops);
-            cudaGetLastError() >> CUDA_CHECK;
+            fill_uniform_keys(d_get_keys, args.n_ops, key_range, gen);
         },
-        /*launch=*/ [&]() { table.insert(d_keys, d_values, args.n_ops); },
+        /*launch=*/ [&]() {
+            table.retrieve(d_get_keys, args.n_ops, d_out);
+        },
         /*after=*/  [&](int rep, float ms) {
             rec.write_row(format_row(
                 args.capacity, args.key_range, args.n_ops,
@@ -143,7 +146,7 @@ int main(int argc, char** argv) {
                 args.seed, rep, args.tag, ms));
         });
 
-    cudaFree(d_keys);
-    cudaFree(d_values);
+    cudaFree(d_get_keys);
+    cudaFree(d_out);
     return 0;
 }

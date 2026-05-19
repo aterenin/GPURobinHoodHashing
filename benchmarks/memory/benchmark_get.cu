@@ -1,16 +1,16 @@
-// Get benchmark for gpurhh — counter-instrumented version.
+// Get benchmark for gpurhh — memory-utilization study.
 //
-// Same shape as benchmark_get.cu, but with:
-//   - sum_op (to exercise the reduction path during pre-fill).
-//   - Default MaxProbeBuckets (= 8, study probe-cap regime).
+// Mirrors benchmarks/timing/benchmark_get.cu's structure but with:
+//   - sum_op (exercises the reduction path during pre-fill).
+//   - Default MaxProbeBuckets (= 8) — studies the probe-cap regime.
 //   - Per-tile probe / hit counters via GPURHH_BENCHMARK_COUNTERS.
 //
-// Writes to get_counters.csv with extra total_probes / total_hits /
-// total_misses columns; misses = n_ops - hits.
+// Writes get.csv with the same configuration columns as the timing
+// build plus total_probes, total_hits, total_misses.
 
 #define GPURHH_BENCHMARK_COUNTERS 1
 
-#include "benchmarks.cuh"
+#include "../benchmarks.cuh"
 
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
@@ -49,34 +49,21 @@ struct Args {
     std::filesystem::path output_dir;
 };
 
-[[noreturn]] void die_usage(const char* prog) {
-    std::fprintf(stderr,
-        "usage: %s --output-dir DIR [options]\n"
-        "  Same shape as benchmark_get. Writes get_counters.csv.\n",
-        prog);
-    std::exit(1);
-}
-
 Args parse_args(int argc, char** argv) {
     Args a;
-    for (int i = 1; i < argc; ++i) {
-        std::string flag = argv[i];
-        auto get_val = [&]() -> std::string {
-            if (i + 1 >= argc) { std::fprintf(stderr, "Missing value for %s\n", flag.c_str()); die_usage(argv[0]); }
-            return argv[++i];
-        };
-        if      (flag == "--capacity")   a.capacity   = std::stoull(get_val());
-        else if (flag == "--key-range")  a.key_range  = std::stoull(get_val());
-        else if (flag == "--n-ops")      a.n_ops      = std::stoull(get_val());
-        else if (flag == "--block-size") a.block_size = std::stoi(get_val());
-        else if (flag == "--warmups")    a.warmups    = std::stoi(get_val());
-        else if (flag == "--reps")       a.reps       = std::stoi(get_val());
-        else if (flag == "--seed")       a.seed       = static_cast<std::uint32_t>(std::stoul(get_val()));
-        else if (flag == "--tag")        a.tag        = get_val();
-        else if (flag == "--output-dir") a.output_dir = get_val();
-        else { std::fprintf(stderr, "Unknown flag: %s\n", flag.c_str()); die_usage(argv[0]); }
-    }
-    if (a.output_dir.empty())                     die_usage(argv[0]);
+    ArgParser p(argv[0]);
+    p.add("--capacity",   a.capacity,   "Table size in slots")
+     .add("--key-range",  a.key_range,  "N in Uniform(0, N) for key generation")
+     .add("--n-ops",      a.n_ops,      "Number of get attempts (also pre-fill count)")
+     .add("--block-size", a.block_size, "Threads per CUDA block; multiple of tile_size")
+     .add("--warmups",    a.warmups,    "Untimed warmup reps")
+     .add("--reps",       a.reps,       "Timed reps")
+     .add("--seed",       a.seed,       "cuRAND seed; one stream produces insert then get keys")
+     .add("--tag",        a.tag,        "Free-form label written to every CSV row")
+     .add("--output-dir", a.output_dir, "Required. get.csv is appended to here.");
+    p.parse(argc, argv);
+
+    if (a.output_dir.empty())                     p.print_usage();
     if (a.n_ops == 0)                             { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
     if (a.key_range == 0)                         { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
     if (a.block_size % Table::tile_size != 0)     { std::fprintf(stderr, "--block-size must be a multiple of tile_size (%d)\n", Table::tile_size); std::exit(1); }
@@ -181,7 +168,7 @@ int main(int argc, char** argv) {
     const std::uint32_t key_range = static_cast<std::uint32_t>(args.key_range);
 
     std::fprintf(stderr,
-        "[get-counters] capacity=%zu key_range=%zu n_ops=%zu "
+        "[memory get] capacity=%zu key_range=%zu n_ops=%zu "
         "block_size=%d warmups=%d reps=%d seed=%u tag=\"%s\"\n",
         capacity, args.key_range, args.n_ops,
         args.block_size, args.warmups, args.reps,
@@ -219,7 +206,7 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> h_probes(n_tiles);
     std::vector<std::uint32_t> h_hits  (n_tiles);
 
-    Recorder rec(args.output_dir / "get_counters.csv",
+    Recorder rec(args.output_dir / "get.csv",
         "library,workload,tag,rep,seed,capacity,key_range,"
         "n_ops,block_size,slot_bytes,bytes_per_op,time_ms,"
         "total_probes,total_hits,total_misses");

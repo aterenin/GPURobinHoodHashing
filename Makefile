@@ -58,7 +58,12 @@ TEST_BINS    := $(patsubst tests/%.cu,$(BUILD)/tests/%,$(TEST_SRCS))
 EXAMPLE_SRCS := $(wildcard examples/*.cu)
 EXAMPLE_BINS := $(patsubst examples/%.cu,$(BUILD)/examples/%,$(EXAMPLE_SRCS))
 
-BENCHMARK_SRCS   := $(wildcard benchmarks/benchmark_*.cu)
+# Two benchmark studies under benchmarks/: timing (apples-to-apples kernel
+# throughput vs. cuco / warpcore baselines) and memory (gpurhh's own
+# counter-instrumented probe/failure/hit study, no baselines).
+BENCHMARK_SRCS := \
+    $(wildcard benchmarks/timing/benchmark_*.cu) \
+    $(wildcard benchmarks/memory/benchmark_*.cu)
 
 # Optional baseline libraries. Each is included only if the corresponding
 # header subtree is present under external/include/ (which is gitignored —
@@ -71,10 +76,10 @@ HAVE_CUCO     := $(wildcard $(EXTERNAL_INCLUDE)/cuco)
 HAVE_WARPCORE := $(wildcard $(EXTERNAL_INCLUDE)/warpcore)
 
 ifneq ($(HAVE_CUCO),)
-    BENCHMARK_SRCS += $(wildcard benchmarks/baselines/cuco/benchmark_*.cu)
+    BENCHMARK_SRCS += $(wildcard benchmarks/timing/baselines/cuco/benchmark_*.cu)
 endif
 ifneq ($(HAVE_WARPCORE),)
-    BENCHMARK_SRCS += $(wildcard benchmarks/baselines/warpcore/benchmark_*.cu)
+    BENCHMARK_SRCS += $(wildcard benchmarks/timing/baselines/warpcore/benchmark_*.cu)
 endif
 
 BENCHMARK_BINS   := $(patsubst benchmarks/%.cu,$(BUILD)/benchmarks/%,$(BENCHMARK_SRCS))
@@ -107,12 +112,12 @@ $(BUILD)/benchmarks/%: benchmarks/%.cu $(ALL_HEADERS)
 	$(NVCC) $(NVCC_FLAGS_BENCHMARK) $< -o $@ -lcurand
 
 # Baseline pattern rule — more specific than the catch-all benchmark
-# rule above, so it wins for targets under build/benchmarks/baselines/.
+# rule above, so it wins for targets under build/benchmarks/timing/baselines/.
 # Both cuco and warpcore share -Iexternal/include since the script
 # consolidates them under that single tree. --extended-lambda and
 # --expt-relaxed-constexpr are required by cuCollections's public API
 # (and harmless for warpcore).
-$(BUILD)/benchmarks/baselines/%: benchmarks/baselines/%.cu $(ALL_HEADERS)
+$(BUILD)/benchmarks/timing/baselines/%: benchmarks/timing/baselines/%.cu $(ALL_HEADERS)
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCC_FLAGS_BENCHMARK) -I$(EXTERNAL_INCLUDE) --extended-lambda --expt-relaxed-constexpr $< -o $@ -lcurand
 

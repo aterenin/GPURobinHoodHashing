@@ -4,7 +4,7 @@
 // same raw configuration columns (library distinguishes rows). Derived
 // metrics live in the analysis script, not here.
 
-#include "../../benchmarks.cuh"
+#include "../../../benchmarks.cuh"
 
 #include <cuco/static_map.cuh>
 
@@ -39,37 +39,24 @@ struct Args {
     std::filesystem::path output_dir;
 };
 
-[[noreturn]] void die_usage(const char* prog) {
-    std::fprintf(stderr,
-        "usage: %s --output-dir DIR [options]\n"
-        "  --capacity N --key-range N --n-ops N --warmups N --reps N --seed N --tag STR\n"
-        "  Same shape as benchmarks/benchmark_insert. cuco picks its own internal\n"
-        "  launch shape; --block-size is not a flag here.\n",
-        prog);
-    std::exit(1);
-}
-
+// Same shape as benchmarks/timing/benchmark_insert. cuco picks its own
+// internal launch shape; --block-size is not a flag here.
 Args parse_args(int argc, char** argv) {
     Args a;
-    for (int i = 1; i < argc; ++i) {
-        std::string flag = argv[i];
-        auto get_val = [&]() -> std::string {
-            if (i + 1 >= argc) { std::fprintf(stderr, "Missing value for %s\n", flag.c_str()); die_usage(argv[0]); }
-            return argv[++i];
-        };
-        if      (flag == "--capacity")   a.capacity   = std::stoull(get_val());
-        else if (flag == "--key-range")  a.key_range  = std::stoull(get_val());
-        else if (flag == "--n-ops")      a.n_ops      = std::stoull(get_val());
-        else if (flag == "--warmups")    a.warmups    = std::stoi(get_val());
-        else if (flag == "--reps")       a.reps       = std::stoi(get_val());
-        else if (flag == "--seed")       a.seed       = static_cast<std::uint32_t>(std::stoul(get_val()));
-        else if (flag == "--tag")        a.tag        = get_val();
-        else if (flag == "--output-dir") a.output_dir = get_val();
-        else { std::fprintf(stderr, "Unknown flag: %s\n", flag.c_str()); die_usage(argv[0]); }
-    }
-    if (a.output_dir.empty())  die_usage(argv[0]);
-    if (a.n_ops == 0)          { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
-    if (a.key_range == 0)      { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
+    ArgParser p(argv[0]);
+    p.add("--capacity",   a.capacity,   "Table size in slots")
+     .add("--key-range",  a.key_range,  "N in Uniform(0, N) for key generation")
+     .add("--n-ops",      a.n_ops,      "Number of insert attempts")
+     .add("--warmups",    a.warmups,    "Untimed warmup reps")
+     .add("--reps",       a.reps,       "Timed reps")
+     .add("--seed",       a.seed,       "cuRAND seed for key generation")
+     .add("--tag",        a.tag,        "Free-form label written to every CSV row")
+     .add("--output-dir", a.output_dir, "Required. insert.csv is appended to here.");
+    p.parse(argc, argv);
+
+    if (a.output_dir.empty()) p.print_usage();
+    if (a.n_ops == 0)         { std::fprintf(stderr, "--n-ops must be > 0\n");     std::exit(1); }
+    if (a.key_range == 0)     { std::fprintf(stderr, "--key-range must be > 0\n"); std::exit(1); }
     return a;
 }
 

@@ -1,14 +1,14 @@
 #pragma once
 
 // Shared benchmark infrastructure: CUDA error checking, event-based
-// timing, append-mode CSV recorder, deterministic uniform key generation.
-// Independent of the test suite — benchmarks should not pull in
-// <tests/...>.
+// timing, append-mode CSV recorder, deterministic uniform key generation,
+// a tiny declarative command-line parser. Independent of the test suite
+// — benchmarks should not pull in <tests/...>.
 //
 // This header deliberately does *not* define GPURHH_BENCHMARK_COUNTERS.
-// Counter-instrumented binaries (e.g. benchmark_insert_counters.cu)
-// define it themselves before including this header; comparison
-// binaries omit the define and get the counter-free View::insert /
+// The memory-benchmark binaries (benchmarks/memory/*) define it
+// themselves before including this header; the timing binaries
+// (benchmarks/timing/*) omit it and get the counter-free View::insert /
 // View::get signatures.
 
 #include <gpurhh/hash_table.cuh>
@@ -22,8 +22,12 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <string>
+#include <string_view>
+#include <type_traits>
+#include <vector>
 
 // ----------------------------------------------------------------------------
 // CUDA_CHECK: postfix error-check operator. Identical in shape to the macro
@@ -212,6 +216,104 @@ inline LaunchShape compute_launch_shape(int block_size, int tile_size) {
       * static_cast<std::size_t>(tiles_per_block);
     return {grid_size, tiles_per_block, n_tiles};
 }
+
+// ----------------------------------------------------------------------------
+// ArgParser: tiny declarative command-line parser shared by every binary.
+//
+// Each binary builds an Args struct with default values, then writes:
+//
+//     ArgParser p(argv[0]);
+//     p.add("--capacity",   a.capacity,   "Table size in slots");
+//     p.add("--key-range",  a.key_range,  "N in Uniform(0, N)");
+//     ...
+//     p.parse(argc, argv);
+//     // post-parse validation here, calling p.print_usage() on failure
+//
+// Supported target types: std::size_t, int, std::uint32_t, std::string,
+// std::filesystem::path. Unknown / missing-value / --help all print a
+// generated usage block and exit. There is no support for positional
+// args, short flags, or boolean toggles — the benchmark CLIs don't need
+// any of that.
+// ----------------------------------------------------------------------------
+
+namespace detail {
+
+template <class T>
+inline void assign_arg(T& dst, std::string_view s) {
+    const std::string str(s);
+    if constexpr (std::is_same_v<T, std::size_t>) {
+        dst = std::stoull(str);
+    } else if constexpr (std::is_same_v<T, int>) {
+        dst = std::stoi(str);
+    } else if constexpr (std::is_same_v<T, std::uint32_t>) {
+        dst = static_cast<std::uint32_t>(std::stoul(str));
+    } else if constexpr (std::is_same_v<T, std::string>) {
+        dst = str;
+    } else if constexpr (std::is_same_v<T, std::filesystem::path>) {
+        dst = std::filesystem::path(str);
+    } else {
+        // Force a compile error mentioning T when an unsupported type sneaks in.
+        static_assert(sizeof(T) == 0, "ArgParser: unsupported target type");
+    }
+}
+
+} // namespace detail
+
+class ArgParser {
+public:
+    explicit ArgParser(const char* prog) : prog_(prog) {}
+
+    template <class T>
+    ArgParser& add(std::string flag, T& target, std::string help = "") {
+        handlers_.push_back(Handler{
+            std::move(flag),
+            std::move(help),
+            [&target](std::string_view s) { detail::assign_arg(target, s); }
+        });
+        return *this;
+    }
+
+    void parse(int argc, char** argv) {
+        for (int i = 1; i < argc; ++i) {
+            const std::string_view flag = argv[i];
+            if (flag == "--help" || flag == "-h") print_usage(0);
+            const Handler* h = find(flag);
+            if (!h) {
+                std::fprintf(stderr, "Unknown flag: %s\n", argv[i]);
+                print_usage(1);
+            }
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "Missing value for %s\n", argv[i]);
+                print_usage(1);
+            }
+            h->setter(argv[++i]);
+        }
+    }
+
+    [[noreturn]] void print_usage(int code = 1) const {
+        std::fprintf(stderr, "usage: %s [options]\n", prog_);
+        for (const auto& h : handlers_) {
+            std::fprintf(stderr, "  %-16s %s\n",
+                         h.flag.c_str(), h.help.c_str());
+        }
+        std::exit(code);
+    }
+
+private:
+    struct Handler {
+        std::string flag;
+        std::string help;
+        std::function<void(std::string_view)> setter;
+    };
+
+    const Handler* find(std::string_view flag) const {
+        for (const auto& h : handlers_) if (h.flag == flag) return &h;
+        return nullptr;
+    }
+
+    const char*          prog_;
+    std::vector<Handler> handlers_;
+};
 
 // Boilerplate runner for the warmup-then-timed-reps pattern shared by
 // every benchmark. The caller passes three callables:
