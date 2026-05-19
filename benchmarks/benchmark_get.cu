@@ -244,15 +244,8 @@ int main(int argc, char** argv) {
         args.insert_seed, args.get_seed, args.tag.c_str());
 
     // --- launch shape ---
-    const int tiles_per_block = args.block_size / Table::tile_size;
-    int device  = 0;
-    int num_sms = 0;
-    cudaGetDevice(&device) >> CUDA_CHECK;
-    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device) >> CUDA_CHECK;
-    const int grid_size = num_sms * 8;
-    const std::size_t n_tiles =
-        static_cast<std::size_t>(grid_size)
-      * static_cast<std::size_t>(tiles_per_block);
+    const auto shape = compute_launch_shape(args.block_size, Table::tile_size);
+    const std::size_t n_tiles = shape.n_tiles;
 
     // --- pre-fill (untimed) ---
     std::uint32_t* d_insert_keys = nullptr;
@@ -270,7 +263,7 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_prefill_failures, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
     cudaMemset(d_prefill_failures, 0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
 
-    prefill<<<grid_size, args.block_size>>>(
+    prefill<<<shape.grid_size, args.block_size>>>(
         table.view(), d_insert_keys, n_ops, d_prefill_failures);
     cudaGetLastError()      >> CUDA_CHECK;
     cudaDeviceSynchronize() >> CUDA_CHECK;
@@ -332,59 +325,46 @@ int main(int argc, char** argv) {
 
     EventTimer timer;
 
-    auto reset_counters = [&]() {
-        cudaMemset(d_probes, 0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
-        cudaMemset(d_hits,   0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
-    };
-    auto launch = [&]() {
-        get<<<grid_size, args.block_size>>>(
-            table.view(), d_get_keys, d_out, n_ops, d_probes, d_hits);
-        cudaGetLastError() >> CUDA_CHECK;
-    };
+    run_benchmark_loop(args.warmups, args.reps, timer,
+        /*setup=*/  [&]() {
+            cudaMemset(d_probes, 0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+            cudaMemset(d_hits,   0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+        },
+        /*launch=*/ [&]() {
+            get<<<shape.grid_size, args.block_size>>>(
+                table.view(), d_get_keys, d_out, n_ops, d_probes, d_hits);
+            cudaGetLastError() >> CUDA_CHECK;
+        },
+        /*after=*/  [&](int rep, float ms) {
+            cudaMemcpy(h_probes.data(), d_probes,
+                       n_tiles * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+            cudaMemcpy(h_hits.data(),   d_hits,
+                       n_tiles * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+            const std::uint64_t total_probes =
+                std::accumulate(h_probes.begin(), h_probes.end(), std::uint64_t{0});
+            const std::uint64_t total_hits =
+                std::accumulate(h_hits.begin(),   h_hits.end(),   std::uint64_t{0});
+            const std::uint64_t total_misses = std::uint64_t{n_ops} - total_hits;
 
-    // --- warmups ---
-    for (int w = 0; w < args.warmups; ++w) {
-        reset_counters();
-        launch();
-    }
-    cudaDeviceSynchronize() >> CUDA_CHECK;
+            const double ops_per_sec =
+                static_cast<double>(n_ops) / (static_cast<double>(ms) * 1.0e-3);
+            const double gbps_floor =
+                static_cast<double>(n_ops) * static_cast<double>(bytes_per_op)
+                    / (static_cast<double>(ms) * 1.0e6);
+            const double gbps_corrected =
+                static_cast<double>(total_probes) * static_cast<double>(bytes_per_op)
+                    / (static_cast<double>(ms) * 1.0e6);
 
-    // --- timed reps ---
-    for (int r = 0; r < args.reps; ++r) {
-        reset_counters();
-        timer.begin();
-        launch();
-        const float ms = timer.end_ms();
-
-        cudaMemcpy(h_probes.data(), d_probes,
-                   n_tiles * sizeof(std::uint32_t),
-                   cudaMemcpyDeviceToHost) >> CUDA_CHECK;
-        cudaMemcpy(h_hits.data(),   d_hits,
-                   n_tiles * sizeof(std::uint32_t),
-                   cudaMemcpyDeviceToHost) >> CUDA_CHECK;
-        const std::uint64_t total_probes =
-            std::accumulate(h_probes.begin(), h_probes.end(), std::uint64_t{0});
-        const std::uint64_t total_hits =
-            std::accumulate(h_hits.begin(),   h_hits.end(),   std::uint64_t{0});
-        const std::uint64_t total_misses = std::uint64_t{n_ops} - total_hits;
-
-        const double ops_per_sec =
-            static_cast<double>(n_ops) / (static_cast<double>(ms) * 1.0e-3);
-        const double gbps_floor =
-            static_cast<double>(n_ops) * static_cast<double>(bytes_per_op)
-                / (static_cast<double>(ms) * 1.0e6);
-        const double gbps_corrected =
-            static_cast<double>(total_probes) * static_cast<double>(bytes_per_op)
-                / (static_cast<double>(ms) * 1.0e6);
-
-        csv.write_row(format_row(
-            slot_bytes, capacity, capacity_bytes,
-            std::size_t{key_range}, /*alpha=*/1.0, args.load_factor,
-            args.block_size, n_ops, bytes_per_op,
-            args.insert_seed, args.get_seed, r, args.tag,
-            ms, ops_per_sec, gbps_floor, gbps_corrected,
-            total_probes, total_hits, total_misses, prefill_failures));
-    }
+            csv.write_row(format_row(
+                slot_bytes, capacity, capacity_bytes,
+                std::size_t{key_range}, /*alpha=*/1.0, args.load_factor,
+                args.block_size, n_ops, bytes_per_op,
+                args.insert_seed, args.get_seed, rep, args.tag,
+                ms, ops_per_sec, gbps_floor, gbps_corrected,
+                total_probes, total_hits, total_misses, prefill_failures));
+        });
 
     cudaFree(d_get_keys);
     cudaFree(d_out);

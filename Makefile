@@ -79,7 +79,7 @@ BENCHMARK_BINS   := $(patsubst benchmarks/%.cu,$(BUILD)/benchmarks/%,$(BENCHMARK
 # small project; revisit if compile times become an issue.
 ALL_HEADERS := $(shell find include tests benchmarks -name "*.cuh" 2>/dev/null)
 
-.PHONY: all tests examples benchmarks test benchmark clean
+.PHONY: all tests examples benchmarks test benchmark benchmark-baselines clean
 
 all: tests examples
 
@@ -94,6 +94,13 @@ test: $(TEST_BINS)
 # BENCHMARK_OPT above); override via OPT=... if needed.
 benchmark: $(BENCHMARK_BINS)
 	@bash scripts/benchmark.sh
+
+# Run the baseline sweep against external libraries that built (cuco,
+# warpcore — see scripts/setup-baselines.sh). Same OPT default applies.
+# Pass an existing output dir as arg to scripts/benchmark-baselines.sh
+# to fold baseline rows into a gpurhh run's CSVs for overlaid plotting.
+benchmark-baselines: $(BENCHMARK_BINS)
+	@bash scripts/benchmark-baselines.sh
 
 $(BUILD)/tests/%: tests/%.cu $(ALL_HEADERS)
 	@mkdir -p $(BUILD)/tests
@@ -110,10 +117,12 @@ $(BUILD)/benchmarks/%: benchmarks/%.cu $(ALL_HEADERS)
 # Baseline pattern rule — more specific than the catch-all benchmark
 # rule above, so it wins for targets under build/benchmarks/baselines/.
 # Both cuco and warpcore share -Iexternal/include since the script
-# consolidates them under that single tree.
+# consolidates them under that single tree. --extended-lambda and
+# --expt-relaxed-constexpr are required by cuCollections's public API
+# (and harmless for warpcore).
 $(BUILD)/benchmarks/baselines/%: benchmarks/baselines/%.cu $(ALL_HEADERS)
 	@mkdir -p $(dir $@)
-	$(NVCC) $(NVCC_FLAGS_BENCHMARK) -I$(EXTERNAL_INCLUDE) $< -o $@
+	$(NVCC) $(NVCC_FLAGS_BENCHMARK) -I$(EXTERNAL_INCLUDE) --extended-lambda --expt-relaxed-constexpr $< -o $@
 
 clean:
 	rm -rf $(BUILD)

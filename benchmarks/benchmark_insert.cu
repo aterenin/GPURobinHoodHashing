@@ -205,17 +205,8 @@ int main(int argc, char** argv) {
     }
 
     // --- launch shape ---
-    const int tiles_per_block = args.block_size / Table::tile_size;
-    int device  = 0;
-    int num_sms = 0;
-    cudaGetDevice(&device) >> CUDA_CHECK;
-    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device) >> CUDA_CHECK;
-    // 8 blocks per SM keeps every SM well-occupied without inflating the
-    // grid past the point of useful concurrency.
-    const int grid_size = num_sms * 8;
-    const std::size_t n_tiles =
-        static_cast<std::size_t>(grid_size)
-      * static_cast<std::size_t>(tiles_per_block);
+    const auto shape = compute_launch_shape(args.block_size, Table::tile_size);
+    const std::size_t n_tiles = shape.n_tiles;
 
     // --- per-tile counter arrays ---
     std::uint32_t* d_probes   = nullptr;
@@ -233,63 +224,46 @@ int main(int argc, char** argv) {
 
     EventTimer timer;
 
-    auto reset_table = [&]() {
-        table.clear();
-    };
-    auto reset_counters = [&]() {
-        cudaMemset(d_probes,   0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
-        cudaMemset(d_failures, 0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
-    };
-    auto launch = [&]() {
-        insert<<<grid_size, args.block_size>>>(
-            table.view(), d_keys, n_ops, d_probes, d_failures);
-        cudaGetLastError() >> CUDA_CHECK;
-    };
+    run_benchmark_loop(args.warmups, args.reps, timer,
+        /*setup=*/  [&]() {
+            table.clear();
+            cudaMemset(d_probes,   0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+            cudaMemset(d_failures, 0, n_tiles * sizeof(std::uint32_t)) >> CUDA_CHECK;
+        },
+        /*launch=*/ [&]() {
+            insert<<<shape.grid_size, args.block_size>>>(
+                table.view(), d_keys, n_ops, d_probes, d_failures);
+            cudaGetLastError() >> CUDA_CHECK;
+        },
+        /*after=*/  [&](int rep, float ms) {
+            cudaMemcpy(h_probes.data(),   d_probes,
+                       n_tiles * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+            cudaMemcpy(h_failures.data(), d_failures,
+                       n_tiles * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToHost) >> CUDA_CHECK;
+            const std::uint64_t total_probes =
+                std::accumulate(h_probes.begin(), h_probes.end(), std::uint64_t{0});
+            const std::uint64_t total_failures =
+                std::accumulate(h_failures.begin(), h_failures.end(), std::uint64_t{0});
 
-    // --- warmups ---
-    for (int w = 0; w < args.warmups; ++w) {
-        reset_table();
-        reset_counters();
-        launch();
-    }
-    cudaDeviceSynchronize() >> CUDA_CHECK;
+            const double ops_per_sec =
+                static_cast<double>(n_ops) / (static_cast<double>(ms) * 1.0e-3);
+            const double gbps_floor =
+                static_cast<double>(n_ops) * static_cast<double>(bytes_per_op)
+                    / (static_cast<double>(ms) * 1.0e6);
+            const double gbps_corrected =
+                static_cast<double>(total_probes) * static_cast<double>(bytes_per_op)
+                    / (static_cast<double>(ms) * 1.0e6);
 
-    // --- timed reps ---
-    for (int r = 0; r < args.reps; ++r) {
-        reset_table();
-        reset_counters();
-        timer.begin();
-        launch();
-        const float ms = timer.end_ms();
-
-        cudaMemcpy(h_probes.data(),   d_probes,
-                   n_tiles * sizeof(std::uint32_t),
-                   cudaMemcpyDeviceToHost) >> CUDA_CHECK;
-        cudaMemcpy(h_failures.data(), d_failures,
-                   n_tiles * sizeof(std::uint32_t),
-                   cudaMemcpyDeviceToHost) >> CUDA_CHECK;
-        const std::uint64_t total_probes =
-            std::accumulate(h_probes.begin(), h_probes.end(), std::uint64_t{0});
-        const std::uint64_t total_failures =
-            std::accumulate(h_failures.begin(), h_failures.end(), std::uint64_t{0});
-
-        const double ops_per_sec =
-            static_cast<double>(n_ops) / (static_cast<double>(ms) * 1.0e-3);
-        const double gbps_floor =
-            static_cast<double>(n_ops) * static_cast<double>(bytes_per_op)
-                / (static_cast<double>(ms) * 1.0e6);
-        const double gbps_corrected =
-            static_cast<double>(total_probes) * static_cast<double>(bytes_per_op)
-                / (static_cast<double>(ms) * 1.0e6);
-
-        csv.write_row(format_row(
-            slot_bytes, capacity, capacity_bytes,
-            std::size_t{key_range}, /*alpha=*/1.0, args.load_factor,
-            args.block_size, n_ops, bytes_per_op,
-            args.seed, r, args.tag,
-            ms, ops_per_sec, gbps_floor, gbps_corrected,
-            total_probes, total_failures));
-    }
+            csv.write_row(format_row(
+                slot_bytes, capacity, capacity_bytes,
+                std::size_t{key_range}, /*alpha=*/1.0, args.load_factor,
+                args.block_size, n_ops, bytes_per_op,
+                args.seed, rep, args.tag,
+                ms, ops_per_sec, gbps_floor, gbps_corrected,
+                total_probes, total_failures));
+        });
 
     cudaFree(d_keys);
     cudaFree(d_probes);

@@ -129,17 +129,15 @@ int main(int argc, char** argv) {
     EventTimer timer;
 
     auto run = [&](const char* workload, auto&& launch) {
-        for (int w = 0; w < args.warmups; ++w) launch();
-        cudaDeviceSynchronize() >> CUDA_CHECK;
-        for (int r = 0; r < args.reps; ++r) {
-            timer.begin();
-            launch();
-            const float ms = timer.end_ms();
-            // Two bytes of DRAM traffic per byte of payload.
-            const double gbps = 2.0 * static_cast<double>(bytes)
-                              / (static_cast<double>(ms) * 1.0e6);
-            csv.write_row(format_row(workload, bytes, r, args.tag, ms, gbps));
-        }
+        run_benchmark_loop(args.warmups, args.reps, timer,
+            /*setup=*/  []() {},
+            /*launch=*/ launch,
+            /*after=*/  [&](int rep, float ms) {
+                // Two bytes of DRAM traffic per byte of payload.
+                const double gbps = 2.0 * static_cast<double>(bytes)
+                                  / (static_cast<double>(ms) * 1.0e6);
+                csv.write_row(format_row(workload, bytes, rep, args.tag, ms, gbps));
+            });
     };
 
     run("memcpy_d2d", [&]() {

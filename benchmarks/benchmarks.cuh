@@ -134,3 +134,59 @@ __global__ void fill_uniform_keys(
     if (tid >= n) return;
     out[tid] = gpurhh::detail::fmix32(static_cast<std::uint32_t>(tid) + seed) % range;
 }
+
+// Launch-shape sizing: queries the current device for SM count, derives a
+// grid size proportional to it (8 blocks per SM keeps SMs occupied without
+// inflating the grid past the point of useful concurrency), and returns
+// the per-block and total tile counts that the benchmark kernels need.
+struct LaunchShape {
+    int         grid_size;
+    int         tiles_per_block;
+    std::size_t n_tiles;
+};
+
+inline LaunchShape compute_launch_shape(int block_size, int tile_size) {
+    int device  = 0;
+    int num_sms = 0;
+    cudaGetDevice(&device) >> CUDA_CHECK;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device)
+        >> CUDA_CHECK;
+
+    const int tiles_per_block = block_size / tile_size;
+    const int grid_size       = num_sms * 8;
+    const std::size_t n_tiles =
+        static_cast<std::size_t>(grid_size)
+      * static_cast<std::size_t>(tiles_per_block);
+    return {grid_size, tiles_per_block, n_tiles};
+}
+
+// Boilerplate runner for the warmup-then-timed-reps pattern shared by
+// every benchmark. The caller passes three callables:
+//
+//   - setup    — invoked before every iteration (both warmups and timed
+//                reps). Use it to zero per-rep counters or clear the
+//                table between insert reps. Defaults to a no-op if the
+//                benchmark has nothing to reset.
+//   - launch   — issues the kernel (or memcpy) being timed.
+//   - after    — invoked after each timed rep with the rep index and
+//                elapsed milliseconds. Use it to read back counters and
+//                emit a CSV row.
+template <class SetupFn, class LaunchFn, class AfterFn>
+inline void run_benchmark_loop(
+    int warmups, int reps, EventTimer& timer,
+    SetupFn&& setup, LaunchFn&& launch, AfterFn&& after)
+{
+    for (int w = 0; w < warmups; ++w) {
+        setup();
+        launch();
+    }
+    cudaDeviceSynchronize() >> CUDA_CHECK;
+
+    for (int r = 0; r < reps; ++r) {
+        setup();
+        timer.begin();
+        launch();
+        const float ms = timer.end_ms();
+        after(r, ms);
+    }
+}
