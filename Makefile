@@ -13,9 +13,13 @@
 #
 #   make tests                          unoptimized
 #   make tests     OPT=-O3              optimized tests
-#   make benchmark                      sweep at -O3 (default for benchmarks)
-#   make benchmark OPT=-O0              sweep unoptimized (rarely useful)
+#   make benchmarks OPT=-O0             benchmarks unoptimized (rarely useful)
 #   make test      OPT="-O0 -G -g"      debuggable test build
+#
+# Tests run via `make test`; benchmarks run via the standalone driver
+# scripts/benchmark.sh (optionally with --with-baselines). The
+# benchmark sweep is heavy enough that keeping its invocation out of
+# the Makefile makes the inner-loop test target faster and clearer.
 #
 # EXTRA is appended to the nvcc command line on top of OPT. Useful for
 # one-off additions (e.g. `make tests EXTRA=-lineinfo`).
@@ -79,7 +83,7 @@ BENCHMARK_BINS   := $(patsubst benchmarks/%.cu,$(BUILD)/benchmarks/%,$(BENCHMARK
 # small project; revisit if compile times become an issue.
 ALL_HEADERS := $(shell find include tests benchmarks -name "*.cuh" 2>/dev/null)
 
-.PHONY: all tests examples benchmarks test benchmark benchmark-baselines clean
+.PHONY: all tests examples benchmarks test clean
 
 all: tests examples
 
@@ -89,18 +93,6 @@ benchmarks: $(BENCHMARK_BINS)
 
 test: $(TEST_BINS)
 	@set -e; for t in $(TEST_BINS); do echo "==> $$t"; "$$t"; done
-
-# Run the full benchmark sweep. Benchmark binaries default to -O3 (see
-# BENCHMARK_OPT above); override via OPT=... if needed.
-benchmark: $(BENCHMARK_BINS)
-	@bash scripts/benchmark.sh
-
-# Run the baseline sweep against external libraries that built (cuco,
-# warpcore — see scripts/setup-baselines.sh). Same OPT default applies.
-# Pass an existing output dir as arg to scripts/benchmark-baselines.sh
-# to fold baseline rows into a gpurhh run's CSVs for overlaid plotting.
-benchmark-baselines: $(BENCHMARK_BINS)
-	@bash scripts/benchmark-baselines.sh
 
 $(BUILD)/tests/%: tests/%.cu $(ALL_HEADERS)
 	@mkdir -p $(BUILD)/tests

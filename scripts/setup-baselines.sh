@@ -18,9 +18,15 @@ set -euo pipefail
 
 # --- pinned versions -------------------------------------------------------
 # Format per entry: "<name> <url> <commit>"
+#
+# hpc_helpers is a transitive dependency of warpcore (provides
+# <helpers/cuda_helpers.cuh>, <helpers/packed_types.cuh>). It is hosted
+# on a self-hosted GitLab; the `restructure` branch is what warpcore's
+# CMakeLists pins via CPM. We mirror that pin here.
 LIBS=(
-    "cuCollections https://github.com/NVIDIA/cuCollections.git d4e84ee20b9185a3aa279ce184416bd41e53287f"
-    "warpcore      https://github.com/sleeepyjack/warpcore.git  1a2fe03d438e8dfa1dbd8d9da73f183bd2d72051"
+    "cuCollections https://github.com/NVIDIA/cuCollections.git    d4e84ee20b9185a3aa279ce184416bd41e53287f"
+    "warpcore      https://github.com/sleeepyjack/warpcore.git    1a2fe03d438e8dfa1dbd8d9da73f183bd2d72051"
+    "hpc_helpers   https://gitlab.rlp.net/pararch/hpc_helpers.git 232b928cd69bc29ad3d9c65d661bd1073cf4b779"
 )
 
 # --- script body -----------------------------------------------------------

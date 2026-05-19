@@ -386,7 +386,7 @@ At low F the two converge (avg probe length ≈ 1). At high F the corrected numb
 
 `scripts/benchmark.sh` runs the full grid (50 invocations for the gpurhh workloads + 1 memcpy reference) and writes one CSV per workload (`memcpy.csv`, `insert.csv`, `get.csv`) plus a `run_info.txt` sidecar with `nvcc --version`, `uname`, and `nvidia-smi`'s GPU name / driver version / memory size / power limit. Default output dir is `output/` under the repo root; can be overridden by passing a path as the first argument.
 
-`make benchmark` builds the binaries at `-O3` (the default for the benchmark pattern rule; see Makefile) and then invokes the sweep script. Numbers from unoptimized builds are meaningless, so the `-O3` default is non-overridable in practice.
+`make benchmarks` builds the binaries at `-O3` (the default for the benchmark pattern rule; see Makefile); the sweep itself is launched directly from `scripts/benchmark.sh` rather than a make target, since benchmark runs are heavy and infrequent compared with the build / test inner loop. Pass `--with-baselines` to the script to also run any external comparison libraries that built. Numbers from unoptimized builds are meaningless, so the `-O3` default is non-overridable in practice.
 
 ## Known limitations
 

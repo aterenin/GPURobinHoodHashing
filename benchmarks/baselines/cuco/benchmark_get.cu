@@ -151,9 +151,12 @@ int main(int argc, char** argv) {
         cudaGetLastError() >> CUDA_CHECK;
     }
 
+    // Trailing return type is required: extended __device__ lambdas
+    // whose result type is queried from host code (thrust's
+    // transform_iterator deduces its reference type that way) need it.
     auto insert_pair_begin = thrust::make_transform_iterator(
         d_insert_keys,
-        [] __device__ (Key k) {
+        [] __device__ (Key k) -> cuco::pair<Key, Value> {
             return cuco::pair<Key, Value>{k, gpurhh::detail::fmix32(k)};
         });
 
