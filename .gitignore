@@ -2,5 +2,4 @@
 .vscode
 build/
 output/
-external/*
-!external/versions.txt
+external/

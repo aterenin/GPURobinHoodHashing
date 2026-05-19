@@ -55,6 +55,24 @@ EXAMPLE_SRCS := $(wildcard examples/*.cu)
 EXAMPLE_BINS := $(patsubst examples/%.cu,$(BUILD)/examples/%,$(EXAMPLE_SRCS))
 
 BENCHMARK_SRCS   := $(wildcard benchmarks/benchmark_*.cu)
+
+# Optional baseline libraries. Each is included only if the corresponding
+# header subtree is present under external/include/ (which is gitignored —
+# run scripts/setup-baselines.sh to populate, see that script for the
+# pinned commits). When absent, the baselines silently drop out and
+# `make benchmarks` produces just the gpurhh binaries.
+EXTERNAL_INCLUDE := external/include
+
+HAVE_CUCO     := $(wildcard $(EXTERNAL_INCLUDE)/cuco)
+HAVE_WARPCORE := $(wildcard $(EXTERNAL_INCLUDE)/warpcore)
+
+ifneq ($(HAVE_CUCO),)
+    BENCHMARK_SRCS += $(wildcard benchmarks/baselines/cuco/benchmark_*.cu)
+endif
+ifneq ($(HAVE_WARPCORE),)
+    BENCHMARK_SRCS += $(wildcard benchmarks/baselines/warpcore/benchmark_*.cu)
+endif
+
 BENCHMARK_BINS   := $(patsubst benchmarks/%.cu,$(BUILD)/benchmarks/%,$(BENCHMARK_SRCS))
 
 # Treat any header change as a reason to rebuild everything. Adequate for a
@@ -86,8 +104,16 @@ $(BUILD)/examples/%: examples/%.cu $(ALL_HEADERS)
 	$(NVCC) $(NVCC_FLAGS) $< -o $@
 
 $(BUILD)/benchmarks/%: benchmarks/%.cu $(ALL_HEADERS)
-	@mkdir -p $(BUILD)/benchmarks
+	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCC_FLAGS_BENCHMARK) $< -o $@
+
+# Baseline pattern rule — more specific than the catch-all benchmark
+# rule above, so it wins for targets under build/benchmarks/baselines/.
+# Both cuco and warpcore share -Iexternal/include since the script
+# consolidates them under that single tree.
+$(BUILD)/benchmarks/baselines/%: benchmarks/baselines/%.cu $(ALL_HEADERS)
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCC_FLAGS_BENCHMARK) -I$(EXTERNAL_INCLUDE) $< -o $@
 
 clean:
 	rm -rf $(BUILD)
