@@ -10,8 +10,7 @@
 // provides:
 //
 //   - set_state / read_state — direct cudaMemcpy into / out of the table's
-//     internal bucket array (requires GPURHH_ENABLE_INTERNAL_ACCESS, set
-//     by tests.cuh).
+//     internal bucket array via HashTable::data().
 //   - insert_many / run_insert — tile-strided insert and host-side
 //     launcher.
 //   - assert_robin_hood_invariant — structural check usable as a safety
@@ -23,8 +22,6 @@
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
-// tests.cuh must precede the gpurhh header — it sets the
-// GPURHH_ENABLE_INTERNAL_ACCESS macro that exposes HashTable::data().
 #include "tests.cuh"
 #include <gpurhh/hash_table.cuh>
 

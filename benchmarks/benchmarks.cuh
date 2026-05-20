@@ -16,6 +16,9 @@
 #include <cuda_runtime.h>
 #include <curand.h>
 
+#include <thrust/count.h>
+#include <thrust/execution_policy.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -199,6 +202,28 @@ inline LaunchShape compute_launch_shape(int block_size, int tile_size) {
         static_cast<std::size_t>(grid_size)
       * static_cast<std::size_t>(tiles_per_block);
     return {grid_size, tiles_per_block, n_tiles};
+}
+
+// Count slots in `[slots, slots + n)` whose key is not `empty_key`. Used
+// by the drop-counting plumbing in the insert benchmarks: after the
+// timed kernel, scan the table and compare to the pre-counted unique-
+// input count to derive how many keys the library failed to land.
+//
+// Synchronous (blocks on `stream` via thrust's reduction). Pulls in
+// `<thrust/count.h>`; lives in the benchmark header so the gpurhh public
+// API stays dependency-free. Templated on Slot so it works against any
+// table whose slot type has a `key` field — i.e. gpurhh's own slots and,
+// if needed later, slot-like reinterpretations of baseline storage.
+template <class Slot, class Key>
+inline std::size_t count_occupied_slots(
+    const Slot* slots, std::size_t n, Key empty_key,
+    cudaStream_t stream = 0)
+{
+    const Key ek = empty_key;
+    return thrust::count_if(
+        thrust::cuda::par.on(stream),
+        slots, slots + n,
+        [ek] __device__ (const Slot& s) { return s.key != ek; });
 }
 
 // ----------------------------------------------------------------------------

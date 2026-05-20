@@ -6,21 +6,10 @@
 // Lives in a separate header so the core library is independent of
 // <cstdio> and <vector>, and so that pulling print support in is opt-in.
 //
-// Relies on HashTable::data(), which is gated behind
-// GPURHH_ENABLE_INTERNAL_ACCESS: that macro must be defined in the
-// translation unit before any gpurhh header is included. All operations
-// here copy bucket contents to host via cudaMemcpy and print to stdout;
-// none of this is synchronized against concurrent device-side activity.
-//
-// We cannot define the macro here ourselves: <gpurhh/hash_table.cuh>
-// uses `#pragma once`, so by the time control reaches this header it
-// may already have been processed (without the macro set, leaving
-// data() invisible). Instead we require the user to define the macro
-// up-front, and fail compilation early with a clear message otherwise.
-
-#ifndef GPURHH_ENABLE_INTERNAL_ACCESS
-#error "<gpurhh/print.cuh> requires GPURHH_ENABLE_INTERNAL_ACCESS to be defined before any gpurhh header is included"
-#endif
+// Relies on HashTable::data() to access the underlying bucket storage.
+// All operations here copy bucket contents to host via cudaMemcpy and
+// print to stdout; none of this is synchronized against concurrent
+// device-side activity.
 
 #include <gpurhh/hash_table.cuh>
 

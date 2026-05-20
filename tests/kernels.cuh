@@ -13,8 +13,6 @@
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
-// tests.cuh must precede the gpurhh header — it sets the
-// GPURHH_ENABLE_INTERNAL_ACCESS macro that exposes HashTable::data().
 #include "tests.cuh"
 #include <gpurhh/hash_table.cuh>
 

@@ -10,6 +10,8 @@
 
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
+#include <thrust/sort.h>
+#include <thrust/unique.h>
 
 #include <cuda_runtime.h>
 
@@ -64,7 +66,7 @@ std::string format_row(
     std::size_t capacity, std::size_t n_ops,
     std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
-    float time_ms)
+    float time_ms, std::size_t drops)
 {
     std::ostringstream s;
     s.precision(9);
@@ -77,7 +79,8 @@ std::string format_row(
       << ","          // block_size empty for cuco
       << slot_bytes   << ","
       << bytes_per_op << ","
-      << time_ms;
+      << time_ms      << ","
+      << drops;
     return s.str();
 }
 
@@ -95,15 +98,19 @@ int main(int argc, char** argv) {
         args.capacity, args.n_ops,
         args.warmups, args.reps, args.seed, args.tag.c_str());
 
-    // d_keys: refreshed per rep in setup.
+    // d_keys:   refreshed per rep in setup.
     // d_values: zeroed once below. Apples-to-apples with gpurhh's timing
-    // build — the cuco insert kernel pays the d_values input read via
-    // the transform iterator below, even though under replace_op the
-    // value content is irrelevant.
+    //           build — the cuco insert kernel pays the d_values input
+    //           read via the transform iterator below, even though under
+    //           replace_op the value content is irrelevant.
+    // d_sorted: scratch copy of d_keys, sorted in setup and uniqued to
+    //           count distinct inputs for drop accounting (n_ops_unique).
     Key*   d_keys   = nullptr;
     Value* d_values = nullptr;
+    Key*   d_sorted = nullptr;
     cudaMalloc(&d_keys,   args.n_ops * sizeof(Key))   >> CUDA_CHECK;
     cudaMalloc(&d_values, args.n_ops * sizeof(Value)) >> CUDA_CHECK;
+    cudaMalloc(&d_sorted, args.n_ops * sizeof(Key))   >> CUDA_CHECK;
     cudaMemset(d_values, 0, args.n_ops * sizeof(Value)) >> CUDA_CHECK;
     UniformKeyGenerator gen(args.seed);
 
@@ -124,24 +131,38 @@ int main(int argc, char** argv) {
 
     Recorder rec(args.output_dir / "insert.csv",
         "library,workload,tag,rep,seed,capacity,n_ops,block_size,"
-        "slot_bytes,bytes_per_op,time_ms");
+        "slot_bytes,bytes_per_op,time_ms,drops");
 
     EventTimer timer;
+
+    std::size_t n_unique = 0;
 
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
             map.clear_async();
             fill_uniform_keys(d_keys, args.n_ops, gen);
+            // Sort + unique on scratch to count distinct inputs.
+            cudaMemcpy(d_sorted, d_keys, args.n_ops * sizeof(Key),
+                       cudaMemcpyDeviceToDevice) >> CUDA_CHECK;
+            thrust::sort(thrust::device, d_sorted, d_sorted + args.n_ops);
+            auto end = thrust::unique(thrust::device, d_sorted,
+                                      d_sorted + args.n_ops);
+            n_unique = end - d_sorted;
         },
         /*launch=*/ [&]() { map.insert_async(pair_begin, pair_begin + args.n_ops); },
         /*after=*/  [&](int rep, float ms) {
+            // cuco's size() syncs the stream internally.
+            const std::size_t occupied = map.size();
+            const std::size_t drops =
+                n_unique > occupied ? n_unique - occupied : 0;
             rec.write_row(format_row(
                 args.capacity, args.n_ops,
                 slot_bytes, bytes_per_op,
-                args.seed, rep, args.tag, ms));
+                args.seed, rep, args.tag, ms, drops));
         });
 
     cudaFree(d_keys);
     cudaFree(d_values);
+    cudaFree(d_sorted);
     return 0;
 }

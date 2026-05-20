@@ -355,17 +355,14 @@ public:
     // `default_stream` (= 0) selects the runtime's default stream.
     void clear(cudaStream_t stream = default_stream);
 
-#ifdef GPURHH_ENABLE_INTERNAL_ACCESS
     // Direct access to the underlying device-resident bucket array, of
-    // length `capacity() / bucket_size`. Only available when the including
-    // translation unit defines GPURHH_ENABLE_INTERNAL_ACCESS before this
-    // header is included. Provided for tests and diagnostics that need to
-    // inspect or seed table state directly via cudaMemcpy. Bypasses the
+    // length `capacity() / bucket_size`. Provided for tests, diagnostics,
+    // and benchmark instrumentation that need to inspect or seed table
+    // state directly via cudaMemcpy or custom kernels. Bypasses the
     // table's concurrency contract — there is no synchronization against
     // concurrent insert / get from other kernels.
     Bucket*       data() noexcept       { return buckets_; }
     const Bucket* data() const noexcept { return buckets_; }
-#endif
 
 private:
     Bucket*     buckets_  = nullptr;

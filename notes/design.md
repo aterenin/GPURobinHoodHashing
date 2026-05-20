@@ -322,19 +322,18 @@ public:
     // never less than `bucket_size`.
     std::size_t capacity() const noexcept;
 
-#ifdef GPURHH_ENABLE_INTERNAL_ACCESS
-    // Direct pointer access to the device-resident bucket array. Gated
-    // behind a macro so users must opt in explicitly; the test suite does.
+    // Direct pointer access to the device-resident bucket array.
+    // Provided for tests, diagnostics, and benchmark instrumentation —
+    // the `data()` name (matching the `std::vector::data` convention)
+    // and the comment in the header are enough warning that callers
+    // are bypassing the table's concurrency contract.
     Bucket*       data() noexcept;
     const Bucket* data() const noexcept;
-#endif
 };
 
 // Diagnostic helper. Lives in <gpurhh/print.cuh>, a separate header so
-// the core library stays independent of <cstdio> and <vector>. Relies
-// on HashTable::data(), so the including translation unit must define
-// GPURHH_ENABLE_INTERNAL_ACCESS first; <gpurhh/print.cuh> #errors
-// otherwise.
+// the core library stays independent of <cstdio> and <vector>. Reads
+// the bucket array via HashTable::data().
 template <class Table>
 void print_slots(const Table& table, std::size_t start, std::size_t stop);
 
@@ -343,10 +342,9 @@ void print_slots(const Table& table, std::size_t start, std::size_t stop);
 
 ### Opt-in macros
 
-Two macros gate functionality that the core library doesn't expose by default. Both must be defined in the translation unit *before* any `<gpurhh/...>` header is included:
+One macro gates functionality that the core library doesn't expose by default. It must be defined in the translation unit *before* any `<gpurhh/...>` header is included:
 
-- **`GPURHH_ENABLE_INTERNAL_ACCESS`** exposes `HashTable::data()`, giving direct pointer access to the device-resident bucket array. Used by `<gpurhh/print.cuh>` (which `#error`s if the macro is missing) and by the test suite's `set_state` / `read_state` helpers, which need to seed and inspect raw table layouts via `cudaMemcpy` to test corner cases in isolation.
-- **`GPURHH_BENCHMARK_COUNTERS`** adds a trailing `std::uint32_t& tile_counter` parameter to `View::insert` and `View::get`. Lane 0 of the tile increments it on every bucket-load (a CAS-retry re-read counts too — it's a real DRAM transaction). The caller maintains a per-tile register accumulator and writes it out once at end of kernel; no atomics are involved in the probing hot loop. The benchmark binaries enable this; tests and the example do not.
+- **`GPURHH_BENCHMARK_COUNTERS`** adds a trailing `std::uint32_t& tile_counter` parameter to `View::insert` and `View::get`. Lane 0 of the tile increments it on every bucket-load (a CAS-retry re-read counts too — it's a real DRAM transaction). The caller maintains a per-tile register accumulator and writes it out once at end of kernel; no atomics are involved in the probing hot loop. The memory-utilization benchmark binaries enable this; the timing benchmarks, tests, and the example do not.
 
 The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers calls `view.insert(tile, ...)` or `view.get(tile, ...)` directly.
 Bulk host-side operations are deliberately *not* part of the table — callers manage their device buffers and write their own driver kernels.
@@ -365,9 +363,9 @@ The test suite lives in `tests/`, with each `test_*.cu` compiled into its own ex
 
 Three shared infrastructure headers:
 
-- **`tests/tests.cuh`** — the `CUDA_CHECK` postfix error-check operator (`expr >> CUDA_CHECK`) and the `GPURHH_ENABLE_INTERNAL_ACCESS` macro, which gates `HashTable::data()`.
+- **`tests/tests.cuh`** — the `CUDA_CHECK` postfix error-check operator (`expr >> CUDA_CHECK`).
 - **`tests/kernels.cuh`** — the `Table` alias (with `default_hash`), bulk insert/get host helpers, and end-to-end driver kernels. Used by the "combined" and construction tests.
-- **`tests/isolated.cuh`** — the `TestTable` alias (with `IdentityHash` for predictable home buckets), templated `run_insert` / `run_get` / `run_get_one` / `run_insert_with_outcomes`, the `assert_robin_hood_invariant` scanner, and `set_state` / `read_state` for direct table-memory manipulation via the `data()` back-door.
+- **`tests/isolated.cuh`** — the `TestTable` alias (with `IdentityHash` for predictable home buckets), templated `run_insert` / `run_get` / `run_get_one` / `run_insert_with_outcomes`, the `assert_robin_hood_invariant` scanner, and `set_state` / `read_state` for direct table-memory manipulation via `HashTable::data()`.
 
 The `IdentityHash` is the enabling choice for the isolated tests: with `hash(K) = K`, the home bucket of a key is fully predictable from its value, so we can construct any valid Robin Hood state with one `cudaMemcpy` and hand-predict the outcome of small insert sequences. The randomized tests apply a bit-mixing function (the same `fmix32` finalizer used by `default_hash`) as a permutation on sequential integers — this gives distinct random-looking keys without the host-side dedup overhead that an `unordered_set` would require, which is what makes the gigabyte-scale tests fit in memory.
 

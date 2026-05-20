@@ -25,15 +25,29 @@
 //   - Single ~1 GiB table by default, DRAM-resident.
 //
 // Per timed sample:
-//   1. Empty the table, refill d_keys + d_values (untimed setup).
-//   2. Time one kernel that processes n_ops insert ops in a grid-stride loop.
-//   3. Emit a CSV row recording the raw configuration + measured time.
+//   1. Empty the table, refill d_keys (untimed setup).
+//   2. Sort+unique a scratch copy of d_keys to count distinct inputs
+//      (untimed). This is the ground-truth denominator for drop
+//      accounting: at α≈32 most uint32 draws are unique, but a small
+//      fraction are duplicates, and we don't want input duplicates to
+//      show up as "drops" — only true insert failures should.
+//   3. Time one kernel that processes n_ops insert ops in a grid-stride loop.
+//   4. After timing, walk the table and count occupied slots (untimed).
+//      Report drops = unique_inputs − occupied_after.
+//   5. Emit a CSV row with the raw configuration, measured time, and
+//      `drops` column.
 //
 // All derived metrics (ops_per_sec, gbps_floor, load_factor, occupancy,
-// hit_rate, ...) are computed in the analysis script from the raw
+// drop_rate, ...) are computed in the analysis script from the raw
 // CSV columns, not in this binary.
 
+// We use HashTable::data() to reinterpret the bucket storage as a flat
+// Slot array for the post-insert occupancy scan.
+
 #include "../benchmarks.cuh"
+
+#include <thrust/sort.h>
+#include <thrust/unique.h>
 
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
@@ -118,7 +132,7 @@ std::string format_row(
     std::size_t capacity, std::size_t n_ops,
     int block_size, std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
-    float time_ms)
+    float time_ms, std::size_t drops)
 {
     std::ostringstream s;
     s.precision(9);
@@ -131,7 +145,8 @@ std::string format_row(
       << block_size    << ","
       << slot_bytes    << ","
       << bytes_per_op  << ","
-      << time_ms;
+      << time_ms       << ","
+      << drops;
     return s.str();
 }
 
@@ -153,15 +168,18 @@ int main(int argc, char** argv) {
         args.block_size, args.warmups, args.reps, args.seed, args.tag.c_str());
 
     // --- input buffers ---
-    // d_keys: refreshed per rep in setup via cuRAND (cheap, gives iid
-    //   input draws across reps).
+    // d_keys:   refreshed per rep in setup via cuRAND (cheap, iid draws).
     // d_values: zeroed once below. Under replace_op the value content
-    //   doesn't affect work; we only need the buffer present so the
-    //   timed kernel pays the input read.
+    //           doesn't affect work; we only need the buffer present so
+    //           the timed kernel pays the input read.
+    // d_sorted: scratch copy of d_keys, sorted in setup and uniqued to
+    //           count distinct inputs for drop accounting.
     std::uint32_t* d_keys   = nullptr;
     std::uint32_t* d_values = nullptr;
+    std::uint32_t* d_sorted = nullptr;
     cudaMalloc(&d_keys,   args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
     cudaMalloc(&d_values, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
+    cudaMalloc(&d_sorted, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
     cudaMemset(d_values, 0, args.n_ops * sizeof(std::uint32_t)) >> CUDA_CHECK;
     UniformKeyGenerator gen(args.seed);
 
@@ -169,14 +187,26 @@ int main(int argc, char** argv) {
 
     Recorder rec(args.output_dir / "insert.csv",
         "library,workload,tag,rep,seed,capacity,n_ops,block_size,"
-        "slot_bytes,bytes_per_op,time_ms");
+        "slot_bytes,bytes_per_op,time_ms,drops");
 
     EventTimer timer;
+
+    // Ground-truth unique input count for the current rep, set in setup
+    // and read in after.
+    std::size_t n_unique = 0;
 
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
             table.clear();
             fill_uniform_keys(d_keys, args.n_ops, gen);
+            // Sort + unique on a scratch copy to count distinct inputs.
+            cudaMemcpy(d_sorted, d_keys,
+                       args.n_ops * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToDevice) >> CUDA_CHECK;
+            thrust::sort(thrust::device, d_sorted, d_sorted + args.n_ops);
+            auto end = thrust::unique(thrust::device, d_sorted,
+                                      d_sorted + args.n_ops);
+            n_unique = end - d_sorted;
         },
         /*launch=*/ [&]() {
             insert<<<shape.grid_size, args.block_size>>>(
@@ -184,13 +214,21 @@ int main(int argc, char** argv) {
             cudaGetLastError() >> CUDA_CHECK;
         },
         /*after=*/  [&](int rep, float ms) {
+            // Count occupied slots in the table and derive drops.
+            const auto* slots =
+                reinterpret_cast<const Table::Slot*>(table.data());
+            const std::size_t occupied = count_occupied_slots(
+                slots, capacity, Table::empty_key);
+            const std::size_t drops =
+                n_unique > occupied ? n_unique - occupied : 0;
             rec.write_row(format_row(
                 capacity, args.n_ops,
                 args.block_size, slot_bytes, bytes_per_op,
-                args.seed, rep, args.tag, ms));
+                args.seed, rep, args.tag, ms, drops));
         });
 
     cudaFree(d_keys);
     cudaFree(d_values);
+    cudaFree(d_sorted);
     return 0;
 }

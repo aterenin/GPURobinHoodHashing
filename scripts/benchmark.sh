@@ -169,17 +169,15 @@ TAG="sweep"
 REPS=16
 SEED=1
 
-# n_ops multipliers: f * capacity. We compute the raw integers once so
-# the rest of the script passes them as-is. Multipliers for gpurhh
-# (which can run past 1.0) and for cuco/warpcore (capped at < 1.0 to
-# stay below their fixed-capacity limits).
-GPURHH_NOPS=()
-for mul in 0.5 1.0 1.5 2.0 3.0; do
-    GPURHH_NOPS+=($(python3 -c "print(int($mul * $CAPACITY))"))
-done
-BASELINE_NOPS=()
-for mul in 0.5 0.7 0.85 0.95; do
-    BASELINE_NOPS+=($(python3 -c "print(int($mul * $CAPACITY))"))
+# n_ops multipliers: f * capacity, shared across all three libraries.
+# All inserts have bounded probe sequences (gpurhh: MaxProbeBuckets cap;
+# cuco/warpcore: probe up to capacity then give up), so we can run every
+# library at every F point. At F > 1 we measure "how does each library
+# degrade once over-subscribed" — both throughput and drop count are in
+# the CSV, so the timing data and the failure data are both honest.
+NOPS=()
+for mul in 0.5 0.7 0.85 0.95 1.0 1.5 2.0 3.0; do
+    NOPS+=($(python3 -c "print(int($mul * $CAPACITY))"))
 done
 
 # --- timing sweep (memcpy + insert + get for gpurhh) ---------------------
@@ -193,7 +191,7 @@ if [[ "${RUN_TIMING}" -eq 1 ]]; then
         --seed "${SEED}" \
         --tag "${TAG}"
 
-    for n_ops in "${GPURHH_NOPS[@]}"; do
+    for n_ops in "${NOPS[@]}"; do
         for b in "${BLOCK_SIZES[@]}"; do
             echo "==> timing insert n_ops=${n_ops} block=${b}"
             "${TIMING_BIN}/benchmark_insert" \
@@ -220,7 +218,7 @@ fi
 
 # --- memory sweep (counter-instrumented gpurhh study) --------------------
 if [[ "${RUN_MEMORY}" -eq 1 ]]; then
-    for n_ops in "${GPURHH_NOPS[@]}"; do
+    for n_ops in "${NOPS[@]}"; do
         for b in "${BLOCK_SIZES[@]}"; do
             echo "==> memory insert n_ops=${n_ops} block=${b}"
             "${MEMORY_BIN}/benchmark_insert" \
@@ -247,7 +245,7 @@ fi
 
 # --- cuCollections baseline (timing only) --------------------------------
 if [[ "${RUN_CUCO}" -eq 1 ]]; then
-    for n_ops in "${BASELINE_NOPS[@]}"; do
+    for n_ops in "${NOPS[@]}"; do
         echo "==> cuco insert n_ops=${n_ops}"
         "${CUCO_BIN}/benchmark_insert" \
             --output-dir "${TIMING_OUT}" \
@@ -270,7 +268,7 @@ fi
 
 # --- WarpCore baseline (timing only) ------------------------------------
 if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
-    for n_ops in "${BASELINE_NOPS[@]}"; do
+    for n_ops in "${NOPS[@]}"; do
         echo "==> warpcore insert n_ops=${n_ops}"
         "${WARPCORE_BIN}/benchmark_insert" \
             --output-dir "${TIMING_OUT}" \
