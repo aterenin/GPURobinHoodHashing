@@ -26,6 +26,18 @@
 #include <cuda/std/optional>
 #include <cuda_runtime.h>
 
+// IF_GPURHH_BENCHMARK_COUNTERS(stmt): expands to `stmt` when the
+// GPURHH_BENCHMARK_COUNTERS macro is defined, and to nothing otherwise.
+// Used inline at every site where the probe counter would otherwise sit
+// behind an `#ifdef`. Keeps the conditional logic to one line each, and
+// keeps the rest of the header free of scattered preprocessor blocks.
+// `#undef`'d at the bottom of this header so it doesn't leak into TUs.
+#ifdef GPURHH_BENCHMARK_COUNTERS
+#define IF_GPURHH_BENCHMARK_COUNTERS(...) __VA_ARGS__
+#else
+#define IF_GPURHH_BENCHMARK_COUNTERS(...)
+#endif
+
 namespace gpurhh {
 
 // -----------------------------------------------------------------------------
@@ -294,9 +306,7 @@ public:
         template <class Tile>
         __device__ cuda::std::optional<Slot> insert(
             const Tile& tile, Key key, Value value
-#ifdef GPURHH_BENCHMARK_COUNTERS
-            , std::uint32_t& tile_counter
-#endif
+            IF_GPURHH_BENCHMARK_COUNTERS(, std::uint32_t& tile_counter)
         );
 
         // Cooperative single-key lookup. Returns the stored value if the
@@ -308,9 +318,7 @@ public:
         template <class Tile>
         __device__ cuda::std::optional<Value> get(
             const Tile& tile, Key key
-#ifdef GPURHH_BENCHMARK_COUNTERS
-            , std::uint32_t& tile_counter
-#endif
+            IF_GPURHH_BENCHMARK_COUNTERS(, std::uint32_t& tile_counter)
         ) const;
 
         __host__ __device__ std::size_t capacity() const noexcept { return capacity_; }
@@ -455,9 +463,7 @@ template <class K, class V, class H, K E, class R, int CL, int WS, int MPB>
 template <class Tile>
 __device__ auto HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
     const Tile& tile, K key, V value
-#ifdef GPURHH_BENCHMARK_COUNTERS
-    , std::uint32_t& tile_counter
-#endif
+    IF_GPURHH_BENCHMARK_COUNTERS(, std::uint32_t& tile_counter)
 )
     -> cuda::std::optional<Slot>
 {
@@ -482,12 +488,10 @@ __device__ auto HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
     while (probe < probe_bound) {
         const std::size_t bucket_idx = (cur_home + probe) & bucket_mask;
 
-#ifdef GPURHH_BENCHMARK_COUNTERS
         // Count one bucket-load per probe iteration. CAS-retry `continue`s
         // re-enter the loop and re-read the same bucket — those count too,
         // because they are real DRAM transactions.
-        if (tile.thread_rank() == 0) ++tile_counter;
-#endif
+        IF_GPURHH_BENCHMARK_COUNTERS(if (tile.thread_rank() == 0) ++tile_counter;)
 
         // Cooperative load: one coalesced cache-line transaction. Each
         // lane reads one slot of the bucket (lane i reads slots[i]).
@@ -572,9 +576,7 @@ template <class Tile>
 __device__ cuda::std::optional<V>
 HashTable<K, V, H, E, R, CL, WS, MPB>::View::get(
     const Tile& tile, K key
-#ifdef GPURHH_BENCHMARK_COUNTERS
-    , std::uint32_t& tile_counter
-#endif
+    IF_GPURHH_BENCHMARK_COUNTERS(, std::uint32_t& tile_counter)
 ) const
 {
     // Bucket-level Robin Hood lookup. Probe home_bucket, then home_bucket+1,
@@ -597,10 +599,8 @@ HashTable<K, V, H, E, R, CL, WS, MPB>::View::get(
     for (std::size_t probe = 0; probe < probe_bound; ++probe) {
         const std::size_t bucket_idx = (home_bucket + probe) & bucket_mask;
 
-#ifdef GPURHH_BENCHMARK_COUNTERS
         // One bucket-load per probe iteration.
-        if (tile.thread_rank() == 0) ++tile_counter;
-#endif
+        IF_GPURHH_BENCHMARK_COUNTERS(if (tile.thread_rank() == 0) ++tile_counter;)
 
         // Each lane reads one slot — one coalesced cache-line transaction
         // for the whole tile.
@@ -642,3 +642,7 @@ HashTable<K, V, H, E, R, CL, WS, MPB>::View::get(
 }
 
 } // namespace gpurhh
+
+// Helper macro is purely an in-header convenience — undef so it doesn't
+// leak into translation units that include <gpurhh/hash_table.cuh>.
+#undef IF_GPURHH_BENCHMARK_COUNTERS
