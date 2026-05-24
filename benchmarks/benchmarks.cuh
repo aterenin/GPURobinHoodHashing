@@ -18,6 +18,8 @@
 
 #include <thrust/count.h>
 #include <thrust/execution_policy.h>
+#include <thrust/sort.h>
+#include <thrust/unique.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -177,6 +179,43 @@ inline void fill_uniform_keys(
     std::uint32_t* d_out, std::size_t n, UniformKeyGenerator& gen)
 {
     curandGenerate(gen.handle(), d_out, n) >> CUDA_CHECK;
+}
+
+// Fill `d_keys[0..n)` from `gen`, sort a scratch copy into `d_sorted`,
+// and return the number of distinct values in the draw. If n_unique
+// would exceed `capacity`, advance the cuRAND stream and re-draw, up to
+// `max_attempts` total tries. After exhausting all attempts, prints a
+// diagnostic mentioning `library` and the realized F, then std::exit(1).
+//
+// Used by the drop-counting plumbing in the insert benchmarks: it lets
+// the timing build (which uses MaxProbeBuckets = 1 << 20 to match the
+// baselines) safely run at F up to 1 without ever sliding into the
+// multi-hour over-subscription regime where ~F·capacity·(1-1/e) keys
+// can't fit. At α ≈ 32 with F ≤ 1, n_unique's variance is ~10K against
+// a ~2M margin to capacity, so the redraw path is essentially never
+// taken in practice — it's a safety net for future F bumps.
+inline std::size_t fill_uniform_keys_below_capacity(
+    std::uint32_t* d_keys, std::uint32_t* d_sorted,
+    std::size_t n, std::size_t capacity,
+    UniformKeyGenerator& gen, const char* library,
+    int max_attempts = 5)
+{
+    std::size_t n_unique = 0;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        fill_uniform_keys(d_keys, n, gen);
+        cudaMemcpy(d_sorted, d_keys, n * sizeof(std::uint32_t),
+                   cudaMemcpyDeviceToDevice) >> CUDA_CHECK;
+        thrust::sort(thrust::device, d_sorted, d_sorted + n);
+        auto end = thrust::unique(thrust::device, d_sorted, d_sorted + n);
+        n_unique = end - d_sorted;
+        if (n_unique <= capacity) return n_unique;
+    }
+    std::fprintf(stderr,
+        "%s: n_unique=%zu > capacity=%zu after %d attempts (F=%.3f). "
+        "Lower --n-ops; the cuRAND-based timing build targets F <= 1.\n",
+        library, n_unique, capacity, max_attempts,
+        static_cast<double>(n) / capacity);
+    std::exit(1);
 }
 
 // Launch-shape sizing: queries the current device for SM count, derives a

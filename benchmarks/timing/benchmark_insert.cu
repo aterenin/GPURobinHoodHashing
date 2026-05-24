@@ -46,9 +46,6 @@
 
 #include "../benchmarks.cuh"
 
-#include <thrust/sort.h>
-#include <thrust/unique.h>
-
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
@@ -132,7 +129,7 @@ std::string format_row(
     std::size_t capacity, std::size_t n_ops,
     int block_size, std::size_t slot_bytes, std::size_t bytes_per_op,
     std::uint32_t seed, int rep, const std::string& tag,
-    float time_ms, std::size_t drops)
+    float time_ms, std::size_t n_unique, std::size_t drops)
 {
     std::ostringstream s;
     s.precision(9);
@@ -146,6 +143,7 @@ std::string format_row(
       << slot_bytes    << ","
       << bytes_per_op  << ","
       << time_ms       << ","
+      << n_unique      << ","
       << drops;
     return s.str();
 }
@@ -187,7 +185,7 @@ int main(int argc, char** argv) {
 
     Recorder rec(args.output_dir / "insert.csv",
         "library,workload,tag,rep,seed,capacity,n_ops,block_size,"
-        "slot_bytes,bytes_per_op,time_ms,drops");
+        "slot_bytes,bytes_per_op,time_ms,n_unique,drops");
 
     EventTimer timer;
 
@@ -198,15 +196,9 @@ int main(int argc, char** argv) {
     run_benchmark_loop(args.warmups, args.reps, timer,
         /*setup=*/  [&]() {
             table.clear();
-            fill_uniform_keys(d_keys, args.n_ops, gen);
-            // Sort + unique on a scratch copy to count distinct inputs.
-            cudaMemcpy(d_sorted, d_keys,
-                       args.n_ops * sizeof(std::uint32_t),
-                       cudaMemcpyDeviceToDevice) >> CUDA_CHECK;
-            thrust::sort(thrust::device, d_sorted, d_sorted + args.n_ops);
-            auto end = thrust::unique(thrust::device, d_sorted,
-                                      d_sorted + args.n_ops);
-            n_unique = end - d_sorted;
+            n_unique = fill_uniform_keys_below_capacity(
+                d_keys, d_sorted, args.n_ops, capacity, gen,
+                "gpurhh insert");
         },
         /*launch=*/ [&]() {
             insert<<<shape.grid_size, args.block_size>>>(
@@ -224,7 +216,7 @@ int main(int argc, char** argv) {
             rec.write_row(format_row(
                 capacity, args.n_ops,
                 args.block_size, slot_bytes, bytes_per_op,
-                args.seed, rep, args.tag, ms, drops));
+                args.seed, rep, args.tag, ms, n_unique, drops));
         });
 
     cudaFree(d_keys);
