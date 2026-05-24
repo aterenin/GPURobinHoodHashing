@@ -501,19 +501,10 @@ __device__ auto HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
         // (whose current contents we have in `slot`) with the in-flight
         // pair. On the match case the new value is computed as
         // `reduce_(existing, incoming)`; on the empty / displaceable cases
-        // the new value is just the incoming value. Returns one of:
-        //   0 = CAS failed and the slot now holds *some other* key — the
-        //       inner-loop caller can try the next candidate slot.
-        //   1 = CAS succeeded.
-        //   2 = CAS failed and the slot now holds *our* in-flight key,
-        //       i.e. a concurrent insert of the same key won the race.
-        //       The inner-loop caller must abandon its snapshot and
-        //       re-read so the match path can apply our reduction on
-        //       top of the existing value. Without this signal, a tile
-        //       whose snapshot showed multiple empty slots would try
-        //       the next one and double-insert.
-        auto try_cas = [&](int target_lane, bool apply_reduction) -> int {
-            int outcome = 0;
+        // the new value is just the incoming value. Returns the broadcast
+        // result of the CAS to every lane.
+        auto try_cas = [&](int target_lane, bool apply_reduction) -> bool {
+            bool cas_ok = false;
             if (tile.thread_rank() == target_lane) {
                 const V to_store = apply_reduction
                     ? reduce_(slot.value, cur_value)
@@ -522,98 +513,54 @@ __device__ auto HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
                 const Slot desired{cur_key, to_store};
                 cuda::atomic_ref<Slot, cuda::thread_scope_device> atomic_slot(
                     buckets_[bucket_idx].slots[target_lane]);
-                if (atomic_slot.compare_exchange_strong(expected, desired)) {
-                    outcome = 1;
-                } else if (expected.key == cur_key) {
-                    outcome = 2;
-                }
+                cas_ok = atomic_slot.compare_exchange_strong(expected, desired);
             }
-            return tile.shfl(outcome, target_lane);
+            return tile.shfl(cas_ok, target_lane);
         };
 
         // (1) Key match — combine the in-flight value with the existing one
-        //     via the Reduction operator (default: replace). At most one
-        //     resident in a bucket can match the in-flight key, so we try
-        //     a single CAS here; on failure (status 0 or 2) we re-read.
+        //     via the Reduction operator (default: replace).
         const auto match_mask = tile.ballot(slot.key == cur_key);
         if (match_mask != 0) {
-            if (try_cas(__ffs(match_mask) - 1, /*apply_reduction=*/true) == 1)
+            if (try_cas(__ffs(match_mask) - 1, /*apply_reduction=*/true))
                 return cuda::std::nullopt;
             continue;  // CAS lost the race — retry this bucket.
         }
 
-        // (2) Compute both empty and displaceable masks from the same
-        //     snapshot. The empty / displaceable inner loops below try
-        //     each candidate slot in turn without re-reading the bucket
-        //     between CAS attempts: on CAS failure the slot's expected
-        //     state didn't match, so we drop that bit and move to the
-        //     next candidate. Critically, the bucketed Robin Hood
-        //     invariant is per-bucket — within-bucket slot positions
-        //     are interchangeable — so iterating multiple empty or
-        //     multiple displaceable slots from one snapshot is sound.
+        // (2) Empty slot — claim it for our in-flight pair.
+        const auto empty_mask = tile.ballot(slot.key == empty_key);
+        if (empty_mask != 0) {
+            if (try_cas(__ffs(empty_mask) - 1, /*apply_reduction=*/false))
+                return cuda::std::nullopt;
+            continue;  // Someone else took the slot — retry.
+        }
+
+        // (3) Displaceable slot — Robin Hood swap with a richer resident.
+        // Compute each resident's probe distance. (For empty slots this
+        // gives nonsense, but we already eliminated the empty case above,
+        // so the next ballot is meaningful.)
         const std::size_t resident_home =
             (hash_(slot.key) & capacity_mask_) / bucket_size;
         const std::size_t resident_probe =
             (bucket_idx - resident_home) & bucket_mask;
-        auto empty_mask        = tile.ballot(slot.key == empty_key);
-        auto displaceable_mask = tile.ballot(resident_probe < probe);
-
-        // Nothing applicable in this bucket — advance to the next.
-        if (empty_mask == 0 && displaceable_mask == 0) {
-            ++probe;
-            continue;
-        }
-
-        // (3) Empty-first inner loop. Try each empty slot in lane order;
-        //     on plain CAS failure move to the next. If any CAS observes
-        //     our own key already in the slot (status 2), a concurrent
-        //     inserter beat us; abandon the snapshot and re-read so the
-        //     match path can apply our reduction. We must drain empties
-        //     before considering displacement to preserve get's
-        //     empty-slot early-out: if a bucket has any empty slot at
-        //     lookup time, the key is known absent.
-        bool placed         = false;
-        bool saw_duplicate  = false;
-        while (empty_mask != 0) {
-            const int target_lane = __ffs(empty_mask) - 1;
-            const int s = try_cas(target_lane, /*apply_reduction=*/false);
-            if (s == 1) { placed = true; break; }
-            if (s == 2) { saw_duplicate = true; break; }
-            empty_mask &= ~(1u << target_lane);
-        }
-        if (placed)        return cuda::std::nullopt;
-        if (saw_duplicate) continue;  // re-read so match path handles it
-
-        // (4) Displaceable inner loop. Robin-Hood-swap with each richer
-        //     resident in turn. On success, adopt the evicted pair as
-        //     our new in-flight state and let the outer loop continue
-        //     from `resident_probe + 1`. Same duplicate-detection logic
-        //     as the empty loop: another tile may have displaced the
-        //     resident and installed our key in the same slot.
-        bool displaced = false;
-        while (displaceable_mask != 0) {
+        const auto displaceable_mask = tile.ballot(resident_probe < probe);
+        if (displaceable_mask != 0) {
             const int target_lane = __ffs(displaceable_mask) - 1;
-            const int s = try_cas(target_lane, /*apply_reduction=*/false);
-            if (s == 1) {
+            if (try_cas(target_lane, /*apply_reduction=*/false)) {
+                // Adopt the evicted pair as our new in-flight pair. We
+                // continue from the next bucket; the evicted pair's probe
+                // distance there is `resident_probe + 1`.
                 cur_key   = tile.shfl(slot.key,        target_lane);
                 cur_value = tile.shfl(slot.value,      target_lane);
                 cur_home  = tile.shfl(resident_home,   target_lane);
                 probe     = tile.shfl(resident_probe,  target_lane) + 1;
-                displaced = true;
-                break;
+                continue;
             }
-            if (s == 2) { saw_duplicate = true; break; }
-            displaceable_mask &= ~(1u << target_lane);
+            continue;  // CAS lost the race — retry.
         }
-        if (displaced)     continue;  // outer loop with new in-flight state
-        if (saw_duplicate) continue;  // re-read so match path handles it
 
-        // (5) Both inner loops exhausted: every empty / displaceable slot
-        //     in our snapshot got claimed by someone else (without our
-        //     key landing in any of them). Re-read without advancing
-        //     `probe` — subsequent reads may again find empties /
-        //     displaceables, or conclude the bucket is now fully occupied
-        //     with no richer residents and advance next iteration.
+        // (4) Nothing applies — advance one bucket.
+        ++probe;
     }
 
     // Probe budget exhausted. Hand the in-flight pair back so the caller
