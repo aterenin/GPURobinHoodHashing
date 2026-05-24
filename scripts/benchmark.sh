@@ -169,15 +169,31 @@ TAG="sweep"
 REPS=16
 SEED=1
 
-# n_ops multipliers: f * capacity, shared across all three libraries.
-# All inserts have bounded probe sequences (gpurhh: MaxProbeBuckets cap;
-# cuco/warpcore: probe up to capacity then give up), so we can run every
-# library at every F point. At F > 1 we measure "how does each library
-# degrade once over-subscribed" — both throughput and drop count are in
-# the CSV, so the timing data and the failure data are both honest.
-NOPS=()
-for mul in 0.5 0.7 0.85 0.95 1.0 1.5 2.0 3.0; do
-    NOPS+=($(python3 -c "print(int($mul * $CAPACITY))"))
+# n_ops multipliers (F = n_ops / capacity). The timing and memory sweeps
+# use different grids because their cost profiles differ.
+#
+# Timing: gpurhh uses MaxProbeBuckets = 1 << 20 to match cuco/warpcore's
+# effectively-unbounded probing. At F > 1 with α ≈ 32 (raw uint32 keys),
+# the expected n_unique exceeds capacity and each doomed insert walks
+# its full probe budget — which translates to multi-hour wall time per
+# config. We cap timing at F ≤ 1; the achievable occupancy at F = 1 is
+# ~98.5% (132M unique keys in 134M slots due to birthday collisions),
+# high enough to exercise the regime where Robin Hood vs. linear probing
+# differ. The over-subscription story is studied in the memory sweep.
+# Multipliers are expressed as integer percentages of capacity so we can
+# stay in bash arithmetic; e.g. 85 means F = 0.85.
+TIMING_NOPS=()
+for mul_pct in 50 70 85 95 100; do
+    TIMING_NOPS+=($(( mul_pct * CAPACITY / 100 )))
+done
+
+# Memory: gpurhh uses MaxProbeBuckets = 8 (the design default), so
+# failed inserts give up after 8 probe iterations rather than 2^20.
+# F > 1 is tractable here, and the per-tile failure counter is the
+# whole point of this sweep.
+MEMORY_NOPS=()
+for mul_pct in 50 100 150 200 300; do
+    MEMORY_NOPS+=($(( mul_pct * CAPACITY / 100 )))
 done
 
 # --- timing sweep (memcpy + insert + get for gpurhh) ---------------------
@@ -191,7 +207,7 @@ if [[ "${RUN_TIMING}" -eq 1 ]]; then
         --seed "${SEED}" \
         --tag "${TAG}"
 
-    for n_ops in "${NOPS[@]}"; do
+    for n_ops in "${TIMING_NOPS[@]}"; do
         for b in "${BLOCK_SIZES[@]}"; do
             echo "==> timing insert n_ops=${n_ops} block=${b}"
             "${TIMING_BIN}/benchmark_insert" \
@@ -218,7 +234,7 @@ fi
 
 # --- memory sweep (counter-instrumented gpurhh study) --------------------
 if [[ "${RUN_MEMORY}" -eq 1 ]]; then
-    for n_ops in "${NOPS[@]}"; do
+    for n_ops in "${MEMORY_NOPS[@]}"; do
         for b in "${BLOCK_SIZES[@]}"; do
             echo "==> memory insert n_ops=${n_ops} block=${b}"
             "${MEMORY_BIN}/benchmark_insert" \
@@ -245,7 +261,7 @@ fi
 
 # --- cuCollections baseline (timing only) --------------------------------
 if [[ "${RUN_CUCO}" -eq 1 ]]; then
-    for n_ops in "${NOPS[@]}"; do
+    for n_ops in "${TIMING_NOPS[@]}"; do
         echo "==> cuco insert n_ops=${n_ops}"
         "${CUCO_BIN}/benchmark_insert" \
             --output-dir "${TIMING_OUT}" \
@@ -268,7 +284,7 @@ fi
 
 # --- WarpCore baseline (timing only) ------------------------------------
 if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
-    for n_ops in "${NOPS[@]}"; do
+    for n_ops in "${TIMING_NOPS[@]}"; do
         echo "==> warpcore insert n_ops=${n_ops}"
         "${WARPCORE_BIN}/benchmark_insert" \
             --output-dir "${TIMING_OUT}" \
