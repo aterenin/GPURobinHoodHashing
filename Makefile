@@ -48,7 +48,10 @@ endif
 INCLUDES   := -Iinclude
 
 NVCC_FLAGS       := -std=$(CXX_STD) -arch=$(ARCH) $(OPT)       $(INCLUDES) $(EXTRA)
-NVCC_FLAGS_BENCHMARK := -std=$(CXX_STD) -arch=$(ARCH) $(BENCHMARK_OPT) $(INCLUDES) $(EXTRA)
+# --extended-lambda allows __device__-annotated lambdas in benchmark code:
+# benchmarks/benchmarks.cuh uses one inside count_occupied_slots, and the
+# cuco baseline uses one to synthesize cuco::pair<Key, Value> on the fly.
+NVCC_FLAGS_BENCHMARK := -std=$(CXX_STD) -arch=$(ARCH) $(BENCHMARK_OPT) $(INCLUDES) $(EXTRA) --extended-lambda
 
 BUILD := build
 
@@ -114,12 +117,12 @@ $(BUILD)/benchmarks/%: benchmarks/%.cu $(ALL_HEADERS)
 # Baseline pattern rule — more specific than the catch-all benchmark
 # rule above, so it wins for targets under build/benchmarks/timing/baselines/.
 # Both cuco and warpcore share -Iexternal/include since the script
-# consolidates them under that single tree. --extended-lambda and
-# --expt-relaxed-constexpr are required by cuCollections's public API
-# (and harmless for warpcore).
+# consolidates them under that single tree. --expt-relaxed-constexpr is
+# required by cuCollections's public API (and harmless for warpcore);
+# --extended-lambda comes from NVCC_FLAGS_BENCHMARK above.
 $(BUILD)/benchmarks/timing/baselines/%: benchmarks/timing/baselines/%.cu $(ALL_HEADERS)
 	@mkdir -p $(dir $@)
-	$(NVCC) $(NVCC_FLAGS_BENCHMARK) -I$(EXTERNAL_INCLUDE) --extended-lambda --expt-relaxed-constexpr $< -o $@ -lcurand
+	$(NVCC) $(NVCC_FLAGS_BENCHMARK) -I$(EXTERNAL_INCLUDE) --expt-relaxed-constexpr $< -o $@ -lcurand
 
 clean:
 	rm -rf $(BUILD)
