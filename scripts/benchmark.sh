@@ -5,14 +5,19 @@
 # The benchmark suite is split into two studies, each writing its own
 # CSV directory tree under the output dir:
 #
-#   timing/   apples-to-apples kernel throughput (memcpy.csv, insert.csv,
-#             get.csv). gpurhh + optional cuco / warpcore baselines all
-#             append to the same per-workload CSV; the `library` column
-#             distinguishes their rows.
+#   timing/            apples-to-apples kernel throughput (insert.csv,
+#                      get.csv). gpurhh + optional cuco / warpcore
+#                      baselines all append to the same per-workload
+#                      CSV; the `library` column distinguishes rows.
 #
-#   memory/   gpurhh's counter-instrumented probe / failure / hit study
-#             (insert.csv, get.csv with extra count columns). No
-#             baselines — cuco / warpcore don't expose these counters.
+#   memory_bandwidth/  the bandwidth study. memcpy.csv gives the DRAM
+#                      ceiling; insert.csv / get.csv are gpurhh's
+#                      counter-instrumented probe / failure / hit
+#                      study, from which precise per-op DRAM traffic
+#                      (total_probes × sizeof(Bucket) / time_ms) is
+#                      computed and compared against memcpy's ceiling.
+#                      No library baselines — cuco / warpcore don't
+#                      expose the counters.
 #
 # Also written: benchmark.log (transcript) and run_info.txt (host info),
 # both at the top of the output dir. Output defaults to
@@ -24,13 +29,13 @@
 #
 # Pick at least one flag. Passing none prints this usage and exits.
 #
-#   --timing     Run gpurhh's timing sweep (memcpy + insert + get).
-#   --memory     Run gpurhh's memory-utilization sweep
-#                (probe / failure / hit counters).
-#   --cuco       Run the cuCollections baseline (timing only).
-#   --warpcore   Run the WarpCore baseline (timing only).
-#   --all        Shortcut for every flag above; missing binaries are
-#                skipped with a notice rather than erroring.
+#   --timing             Run gpurhh's timing sweep (insert + get).
+#   --memory-bandwidth   Run the bandwidth sweep (memcpy ceiling +
+#                        counter-instrumented gpurhh insert + get).
+#   --cuco               Run the cuCollections baseline (timing only).
+#   --warpcore           Run the WarpCore baseline (timing only).
+#   --all                Shortcut for every flag above; missing binaries
+#                        are skipped with a notice rather than erroring.
 #
 # Individual flags are strict — they error if the corresponding binaries
 # weren't built. --all is lenient.
@@ -44,21 +49,21 @@ print_usage() {
 }
 
 RUN_TIMING=0
-RUN_MEMORY=0
+RUN_MEMBW=0
 RUN_CUCO=0
 RUN_WARPCORE=0
 LENIENT=0
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --timing)    RUN_TIMING=1;   shift ;;
-        --memory)    RUN_MEMORY=1;   shift ;;
-        --cuco)      RUN_CUCO=1;     shift ;;
-        --warpcore)  RUN_WARPCORE=1; shift ;;
-        --all)       RUN_TIMING=1; RUN_MEMORY=1
-                     RUN_CUCO=1;   RUN_WARPCORE=1
-                     LENIENT=1;     shift ;;
-        --help|-h)   print_usage; exit 0 ;;
+        --timing)            RUN_TIMING=1;   shift ;;
+        --memory-bandwidth)  RUN_MEMBW=1;    shift ;;
+        --cuco)              RUN_CUCO=1;     shift ;;
+        --warpcore)          RUN_WARPCORE=1; shift ;;
+        --all)               RUN_TIMING=1; RUN_MEMBW=1
+                             RUN_CUCO=1;   RUN_WARPCORE=1
+                             LENIENT=1;     shift ;;
+        --help|-h)           print_usage; exit 0 ;;
         --*)
             echo "Unknown flag: $1" >&2
             echo "Try '$0 --help' for usage." >&2
@@ -69,7 +74,7 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${POSITIONAL[@]}"
 
-if [[ $((RUN_TIMING + RUN_MEMORY + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
+if [[ $((RUN_TIMING + RUN_MEMBW + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
     print_usage >&2
     exit 1
 fi
@@ -77,7 +82,7 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/build/benchmarks"
 TIMING_BIN="${BUILD_DIR}/timing"
-MEMORY_BIN="${BUILD_DIR}/memory"
+MEMBW_BIN="${BUILD_DIR}/memory_bandwidth"
 CUCO_BIN="${TIMING_BIN}/baselines/cuco"
 WARPCORE_BIN="${TIMING_BIN}/baselines/warpcore"
 
@@ -87,8 +92,8 @@ else
     OUTPUT_DIR="${REPO_ROOT}/output/$(date +%Y-%m-%d_%H-%M-%S)"
 fi
 TIMING_OUT="${OUTPUT_DIR}/timing"
-MEMORY_OUT="${OUTPUT_DIR}/memory"
-mkdir -p "${OUTPUT_DIR}" "${TIMING_OUT}" "${MEMORY_OUT}"
+MEMBW_OUT="${OUTPUT_DIR}/memory_bandwidth"
+mkdir -p "${OUTPUT_DIR}" "${TIMING_OUT}" "${MEMBW_OUT}"
 
 LOG_FILE="${OUTPUT_DIR}/benchmark.log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -111,16 +116,16 @@ require_or_drop() {
 
 if [[ "${RUN_TIMING}" -eq 1 ]]; then
     require_or_drop "timing" \
-        "${TIMING_BIN}/benchmark_memcpy" \
         "${TIMING_BIN}/benchmark_insert" \
         "${TIMING_BIN}/benchmark_get" \
         || RUN_TIMING=0
 fi
-if [[ "${RUN_MEMORY}" -eq 1 ]]; then
-    require_or_drop "memory" \
-        "${MEMORY_BIN}/benchmark_insert" \
-        "${MEMORY_BIN}/benchmark_get" \
-        || RUN_MEMORY=0
+if [[ "${RUN_MEMBW}" -eq 1 ]]; then
+    require_or_drop "memory_bandwidth" \
+        "${MEMBW_BIN}/benchmark_memcpy" \
+        "${MEMBW_BIN}/benchmark_insert" \
+        "${MEMBW_BIN}/benchmark_get" \
+        || RUN_MEMBW=0
 fi
 if [[ "${RUN_CUCO}" -eq 1 ]]; then
     require_or_drop "cuco" \
@@ -135,7 +140,7 @@ if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
         || RUN_WARPCORE=0
 fi
 
-if [[ $((RUN_TIMING + RUN_MEMORY + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
+if [[ $((RUN_TIMING + RUN_MEMBW + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
     echo "Nothing to run." >&2
     exit 1
 fi
@@ -169,8 +174,9 @@ TAG="sweep"
 REPS=16
 SEED=1
 
-# n_ops multipliers (F = n_ops / capacity). The timing and memory sweeps
-# use different grids because their cost profiles differ.
+# n_ops multipliers (F = n_ops / capacity). The timing and
+# memory-bandwidth sweeps use different grids because their cost
+# profiles differ.
 #
 # Timing: gpurhh uses MaxProbeBuckets = 1 << 20 to match cuco/warpcore's
 # effectively-unbounded probing. At F > 1 with α ≈ 32 (raw uint32 keys),
@@ -179,7 +185,7 @@ SEED=1
 # config. We cap timing at F ≤ 1; the achievable occupancy at F = 1 is
 # ~98.5% (132M unique keys in 134M slots due to birthday collisions),
 # high enough to exercise the regime where Robin Hood vs. linear probing
-# differ. The over-subscription story is studied in the memory sweep.
+# differ. The over-subscription story is studied in the bandwidth sweep.
 # Multipliers are expressed as integer percentages of capacity so we can
 # stay in bash arithmetic; e.g. 85 means F = 0.85.
 TIMING_NOPS=()
@@ -187,26 +193,18 @@ for mul_pct in 50 70 85 95 100; do
     TIMING_NOPS+=($(( mul_pct * CAPACITY / 100 )))
 done
 
-# Memory: gpurhh uses MaxProbeBuckets = 8 (the design default), so
-# failed inserts give up after 8 probe iterations rather than 2^20.
-# F > 1 is tractable here, and the per-tile failure counter is the
-# whole point of this sweep.
-MEMORY_NOPS=()
+# Memory-bandwidth: gpurhh uses MaxProbeBuckets = 8 (the design default),
+# so failed inserts give up after 8 probe iterations rather than 2^20.
+# F > 1 is tractable here, and the per-tile probe / failure counters
+# are the whole point of this sweep — they let us derive precise DRAM
+# traffic per op and compare against the memcpy ceiling.
+MEMBW_NOPS=()
 for mul_pct in 50 100 150 200 300; do
-    MEMORY_NOPS+=($(( mul_pct * CAPACITY / 100 )))
+    MEMBW_NOPS+=($(( mul_pct * CAPACITY / 100 )))
 done
 
-# --- timing sweep (memcpy + insert + get for gpurhh) ---------------------
+# --- timing sweep (insert + get for gpurhh) ------------------------------
 if [[ "${RUN_TIMING}" -eq 1 ]]; then
-    BYTES=$(( CAPACITY * SLOT_BYTES ))
-    echo "==> memcpy baseline (${BYTES} B)"
-    "${TIMING_BIN}/benchmark_memcpy" \
-        --output-dir "${TIMING_OUT}" \
-        --bytes "${BYTES}" \
-        --reps "${REPS}" \
-        --seed "${SEED}" \
-        --tag "${TAG}"
-
     for n_ops in "${TIMING_NOPS[@]}"; do
         for b in "${BLOCK_SIZES[@]}"; do
             echo "==> timing insert n_ops=${n_ops} block=${b}"
@@ -232,13 +230,25 @@ if [[ "${RUN_TIMING}" -eq 1 ]]; then
     done
 fi
 
-# --- memory sweep (counter-instrumented gpurhh study) --------------------
-if [[ "${RUN_MEMORY}" -eq 1 ]]; then
-    for n_ops in "${MEMORY_NOPS[@]}"; do
+# --- memory-bandwidth sweep ---------------------------------------------
+# memcpy gives the DRAM ceiling; the counter-instrumented gpurhh inserts /
+# gets give precise per-op bandwidth via total_probes × sizeof(Bucket) /
+# time_ms. Comparing the two yields the bandwidth story.
+if [[ "${RUN_MEMBW}" -eq 1 ]]; then
+    BYTES=$(( CAPACITY * SLOT_BYTES ))
+    echo "==> memcpy ceiling (${BYTES} B)"
+    "${MEMBW_BIN}/benchmark_memcpy" \
+        --output-dir "${MEMBW_OUT}" \
+        --bytes "${BYTES}" \
+        --reps "${REPS}" \
+        --seed "${SEED}" \
+        --tag "${TAG}"
+
+    for n_ops in "${MEMBW_NOPS[@]}"; do
         for b in "${BLOCK_SIZES[@]}"; do
-            echo "==> memory insert n_ops=${n_ops} block=${b}"
-            "${MEMORY_BIN}/benchmark_insert" \
-                --output-dir "${MEMORY_OUT}" \
+            echo "==> memory_bandwidth insert n_ops=${n_ops} block=${b}"
+            "${MEMBW_BIN}/benchmark_insert" \
+                --output-dir "${MEMBW_OUT}" \
                 --capacity "${CAPACITY}" \
                 --n-ops "${n_ops}" \
                 --block-size "${b}" \
@@ -246,9 +256,9 @@ if [[ "${RUN_MEMORY}" -eq 1 ]]; then
                 --seed "${SEED}" \
                 --tag "${TAG}"
 
-            echo "==> memory get    n_ops=${n_ops} block=${b}"
-            "${MEMORY_BIN}/benchmark_get" \
-                --output-dir "${MEMORY_OUT}" \
+            echo "==> memory_bandwidth get    n_ops=${n_ops} block=${b}"
+            "${MEMBW_BIN}/benchmark_get" \
+                --output-dir "${MEMBW_OUT}" \
                 --capacity "${CAPACITY}" \
                 --n-ops "${n_ops}" \
                 --block-size "${b}" \

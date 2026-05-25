@@ -344,7 +344,7 @@ void print_slots(const Table& table, std::size_t start, std::size_t stop);
 
 One macro gates functionality that the core library doesn't expose by default. It must be defined in the translation unit *before* any `<gpurhh/...>` header is included:
 
-- **`GPURHH_BENCHMARK_COUNTERS`** adds a trailing `std::uint32_t& tile_counter` parameter to `View::insert` and `View::get`. Lane 0 of the tile increments it on every bucket-load (a CAS-retry re-read counts too — it's a real DRAM transaction). The caller maintains a per-tile register accumulator and writes it out once at end of kernel; no atomics are involved in the probing hot loop. The memory-utilization benchmark binaries enable this; the timing benchmarks, tests, and the example do not.
+- **`GPURHH_BENCHMARK_COUNTERS`** adds a trailing `std::uint32_t& tile_counter` parameter to `View::insert` and `View::get`. Lane 0 of the tile increments it on every bucket-load (a CAS-retry re-read counts too — it's a real DRAM transaction). The caller maintains a per-tile register accumulator and writes it out once at end of kernel; no atomics are involved in the probing hot loop. The memory-bandwidth benchmark binaries enable this; the timing benchmarks, tests, and the example do not.
 
 The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers calls `view.insert(tile, ...)` or `view.get(tile, ...)` directly.
 Bulk host-side operations are deliberately *not* part of the table — callers manage their device buffers and write their own driver kernels.
@@ -375,10 +375,10 @@ The test suite runs about 35 tests across ~1100 lines of code, against ~350 line
 
 Throughput and instrumentation measurements live in `benchmarks/`, split into two studies with their own directory subtree and their own CSV output tree.
 
-- **`benchmarks/timing/`** — apples-to-apples kernel throughput against optional baselines (`cuCollections::static_map`, `WarpCore::SingleValueHashTable`). gpurhh's binaries here use `replace_op` reduction and `MaxProbeBuckets = 1 << 20` (effectively uncapped), matching the baselines' unbounded-probe semantics. Three executables: `benchmark_memcpy`, `benchmark_insert`, `benchmark_get`. Baseline equivalents live under `benchmarks/timing/baselines/{cuco,warpcore}/` and append to the same per-workload CSVs; the `library` column distinguishes their rows.
-- **`benchmarks/memory/`** — gpurhh's design under instrumentation. Uses `sum_op` reduction and the default `MaxProbeBuckets = 8`. Adds per-tile probe / failure / hit counters via `GPURHH_BENCHMARK_COUNTERS`. No baselines, since neither cuco nor warpcore exposes these counters.
+- **`benchmarks/timing/`** — apples-to-apples kernel throughput against optional baselines (`cuCollections::static_map`, `WarpCore::SingleValueHashTable`). gpurhh's binaries here use `replace_op` reduction and `MaxProbeBuckets = 1 << 20` (effectively uncapped), matching the baselines' unbounded-probe semantics. Two executables: `benchmark_insert`, `benchmark_get`. Baseline equivalents live under `benchmarks/timing/baselines/{cuco,warpcore}/` and append to the same per-workload CSVs; the `library` column distinguishes their rows.
+- **`benchmarks/memory_bandwidth/`** — the bandwidth study. `benchmark_memcpy` provides the empirical DRAM ceiling; `benchmark_insert` and `benchmark_get` are gpurhh's design under instrumentation (`sum_op` reduction, default `MaxProbeBuckets = 8`, per-tile probe / failure / hit counters via `GPURHH_BENCHMARK_COUNTERS`). The CSVs from this study let you compute precise per-op DRAM traffic — `total_probes × sizeof(Bucket) / time_ms` — and compare it against memcpy's ceiling. No library baselines, since neither cuco nor warpcore exposes the per-probe counters needed for the bandwidth analysis.
 
-The split exists because timing and memory characterization want fundamentally different configurations: timing needs the most permissive probe behavior to make per-library performance comparable; memory wants the design's actual default (capped probes, real reduction work) so we can read the probe / failure / hit characteristics back out.
+The split exists because the two studies want fundamentally different configurations: timing needs the most permissive probe behavior to make per-library performance comparable; the bandwidth study wants the design's actual default (capped probes, real reduction work) so we can read the probe / failure / hit characteristics back out and convert them into bandwidth numbers.
 
 `benchmark_memcpy` is the peak-bandwidth reference. Times `cudaMemcpyAsync(... D2D)` and a trivial `uint4`-vectorized copy kernel on a buffer of configurable size. Reports effective GB/s assuming two bytes of DRAM traffic per byte of payload (one read + one write); the achievable-peak number used to normalize the hash-table results.
 
@@ -422,7 +422,7 @@ The get benchmark follows the same phase structure with one difference: the pre-
 
 The `GPURHH_BENCHMARK_COUNTERS` macro (see ## Public API → Opt-in macros) adds a trailing `std::uint32_t&` parameter to `View::insert` / `View::get`. The memory-benchmark kernels declare a per-tile register accumulator, pass it through every `view.insert` / `view.get` call in the grid-stride loop, and flush one value per tile to a global array at end of kernel. No atomics fire in the probe hot loop. The host sums per-tile values into a grand total per rep.
 
-The memory-benchmark CSVs (`memory/insert.csv`, `memory/get.csv`) add `total_probes` and `total_failures` (insert) or `total_probes`, `total_hits`, `total_misses` (get) on top of the timing CSV schema. Downstream analysis derives metrics like average probe length (`total_probes / n_ops`) and bandwidth-corrected throughput (`total_probes × sizeof(Bucket) / time_ms`).
+The memory-bandwidth CSVs (`memory_bandwidth/insert.csv`, `memory_bandwidth/get.csv`) add `total_probes` and `total_failures` (insert) or `total_probes`, `total_hits`, `total_misses` (get) on top of the timing CSV schema. Downstream analysis derives metrics like average probe length (`total_probes / n_ops`) and bandwidth-corrected throughput (`total_probes × sizeof(Bucket) / time_ms`), the latter being directly comparable to the memcpy ceiling in the same directory.
 
 At low F the corrected and uncorrected throughput numbers converge (average probe length ≈ 1). At high F the corrected number diverges upward — that gap is itself a useful signal about how hard Robin Hood is working.
 
@@ -430,13 +430,13 @@ At low F the corrected and uncorrected throughput numbers converge (average prob
 
 `scripts/benchmark.sh` runs the full grid. Flags select which study to run:
 
-- `--timing` — gpurhh's timing sweep (memcpy + insert + get).
-- `--memory` — gpurhh's memory sweep.
+- `--timing` — gpurhh's timing sweep (insert + get).
+- `--memory-bandwidth` — the bandwidth sweep (memcpy ceiling + counter-instrumented gpurhh insert + get).
 - `--cuco` — cuCollections baseline (timing only).
 - `--warpcore` — WarpCore baseline (timing only).
 - `--all` — every flag above; missing binaries are skipped with a notice rather than erroring.
 
-Output goes to `output/<timestamp>/{timing,memory}/{insert,get,memcpy}.csv` with a `run_info.txt` sidecar (`nvcc --version`, `uname`, `nvidia-smi` GPU summary) and a `benchmark.log` transcript. The seed is fixed at 1 across the sweep; `reps = 16` per invocation, with the cuRAND stream refreshing keys before every rep so each rep is an independent input draw.
+Output goes to `output/<timestamp>/timing/{insert,get}.csv` and `output/<timestamp>/memory_bandwidth/{memcpy,insert,get}.csv`, with a `run_info.txt` sidecar (`nvcc --version`, `uname`, `nvidia-smi` GPU summary) and a `benchmark.log` transcript at the top of the output dir. The seed is fixed at 1 across the sweep; `reps = 16` per invocation, with the cuRAND stream refreshing keys before every rep so each rep is an independent input draw.
 
 `make benchmarks` builds the binaries at `-O3` (the default for the benchmark pattern rule). The sweep is launched separately from `scripts/benchmark.sh` because runs are heavy. Numbers from unoptimized builds are meaningless, so the `-O3` default is effectively non-overridable.
 

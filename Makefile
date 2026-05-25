@@ -62,11 +62,12 @@ EXAMPLE_SRCS := $(wildcard examples/*.cu)
 EXAMPLE_BINS := $(patsubst examples/%.cu,$(BUILD)/examples/%,$(EXAMPLE_SRCS))
 
 # Two benchmark studies under benchmarks/: timing (apples-to-apples kernel
-# throughput vs. cuco / warpcore baselines) and memory (gpurhh's own
-# counter-instrumented probe/failure/hit study, no baselines).
+# throughput vs. cuco / warpcore baselines) and memory_bandwidth (the
+# counter-instrumented gpurhh study plus the memcpy ceiling reference,
+# whose ratio gives the bandwidth story).
 BENCHMARK_SRCS := \
     $(wildcard benchmarks/timing/benchmark_*.cu) \
-    $(wildcard benchmarks/memory/benchmark_*.cu)
+    $(wildcard benchmarks/memory_bandwidth/benchmark_*.cu)
 
 # Optional baseline libraries. Each is included only if the corresponding
 # header subtree is present under external/include/ (which is gitignored —
