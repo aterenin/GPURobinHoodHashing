@@ -380,7 +380,7 @@ Throughput and instrumentation measurements live in `benchmarks/`, split into tw
 
 The split exists because the two studies want fundamentally different configurations: timing needs the most permissive probe behavior to make per-library performance comparable; the bandwidth study wants the design's actual default (capped probes, real reduction work) so we can read the probe / failure / hit characteristics back out and convert them into bandwidth numbers.
 
-`benchmark_memcpy` is the peak-bandwidth reference. Times `cudaMemcpyAsync(... D2D)` and a trivial `uint4`-vectorized copy kernel on a buffer of configurable size. Reports effective GB/s assuming two bytes of DRAM traffic per byte of payload (one read + one write); the achievable-peak number used to normalize the hash-table results.
+`benchmark_memcpy` is the peak-bandwidth reference. Times `cudaMemcpyAsync(... D2D)` and a trivial `uint4`-vectorized copy kernel on a buffer of configurable size. The CSV stores `dram_bytes = 2 * payload_bytes` (one read of src + one write of dst), so the downstream bandwidth computation is simply `dram_bytes / time_ms` — and this is directly comparable to the hash-table benchmarks' `total_probes × sizeof(Bucket) / time_ms`, since both metrics are bytes through the DRAM controller per second. Recording the 2× factor at write time rather than relying on downstream scripts to apply it keeps the convention impossible to misuse in analysis.
 
 ### Workload knobs
 

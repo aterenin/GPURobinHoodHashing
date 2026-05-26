@@ -3,9 +3,12 @@
 // Measures device-to-device memory bandwidth via two flavors:
 //   - workload=memcpy_d2d    — cudaMemcpyAsync(..., DeviceToDevice)
 //   - workload=memcpy_kernel — a trivial uint4-aligned copy kernel
-// Both report effective GB/s assuming two bytes of DRAM traffic per byte
-// of payload (one read plus one write). Used as a peak-bandwidth
-// reference line for the insert / get benchmarks.
+// Both record `dram_bytes = 2 * payload_bytes` in the CSV (one read of
+// src + one write of dst). Downstream bandwidth = dram_bytes / time_ms,
+// directly comparable to the hash-table benchmarks' `total_probes ×
+// sizeof(Bucket) / time_ms` since both are bytes through the DRAM
+// controller per second. Used as the peak-bandwidth reference line for
+// the insert / get benchmarks in the same directory.
 
 #include "../benchmarks.cuh"
 
@@ -55,18 +58,25 @@ __global__ void copy(uint4* dst, const uint4* src, std::size_t n) {
     if (tid < n) dst[tid] = src[tid];
 }
 
+// The CSV stores `dram_bytes`, defined as the total number of bytes
+// moved through the DRAM controller during a copy: one read of the
+// source plus one write of the destination, i.e. `2 * payload_bytes`.
+// This is the quantity that maps to bandwidth (= dram_bytes / time)
+// in apples-to-apples fashion with the hash-table benchmarks, whose
+// `total_probes × sizeof(Bucket)` is also measured at the DRAM
+// controller (probes are reads; CAS writes are negligible).
 std::string format_row(const std::string& workload, const std::string& tag,
-                       int rep, std::uint32_t seed, std::size_t bytes,
+                       int rep, std::uint32_t seed, std::size_t dram_bytes,
                        float time_ms)
 {
     std::ostringstream s;
     s.precision(9);
     s << "cuda,"
-      << workload   << ","
-      << tag        << ","
-      << rep        << ","
-      << seed       << ","
-      << bytes      << ","
+      << workload    << ","
+      << tag         << ","
+      << rep         << ","
+      << seed        << ","
+      << dram_bytes  << ","
       << time_ms;
     return s.str();
 }
@@ -76,9 +86,10 @@ std::string format_row(const std::string& workload, const std::string& tag,
 int main(int argc, char** argv) {
     const Args args = parse_args(argc, argv);
 
-    const std::size_t bytes = args.bytes;
-    const std::size_t n_u32 = bytes / sizeof(std::uint32_t);
-    const std::size_t n_u4  = bytes / sizeof(uint4);
+    const std::size_t bytes      = args.bytes;
+    const std::size_t dram_bytes = 2 * bytes;   // see format_row comment
+    const std::size_t n_u32      = bytes / sizeof(std::uint32_t);
+    const std::size_t n_u4       = bytes / sizeof(uint4);
 
     std::fprintf(stderr,
         "[memcpy] bytes=%zu warmups=%d reps=%d seed=%u tag=\"%s\"\n",
@@ -99,7 +110,7 @@ int main(int argc, char** argv) {
     cudaDeviceSynchronize() >> CUDA_CHECK;
 
     Recorder rec(args.output_dir / "memcpy.csv",
-        "library,workload,tag,rep,seed,bytes,time_ms");
+        "library,workload,tag,rep,seed,dram_bytes,time_ms");
 
     EventTimer timer;
 
@@ -109,7 +120,7 @@ int main(int argc, char** argv) {
             /*launch=*/ launch,
             /*after=*/  [&](int rep, float ms) {
                 rec.write_row(format_row(
-                    workload, args.tag, rep, args.seed, bytes, ms));
+                    workload, args.tag, rep, args.seed, dram_bytes, ms));
             });
     };
 

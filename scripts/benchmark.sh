@@ -197,9 +197,12 @@ done
 # so failed inserts give up after 8 probe iterations rather than 2^20.
 # F > 1 is tractable here, and the per-tile probe / failure counters
 # are the whole point of this sweep — they let us derive precise DRAM
-# traffic per op and compare against the memcpy ceiling.
+# traffic per op and compare against the memcpy ceiling. We include the
+# same F ≤ 1 points as the timing sweep (so bandwidth panels line up
+# with timing panels at low F) and then extend into the F > 1
+# over-subscription regime where failure counters become informative.
 MEMBW_NOPS=()
-for mul_pct in 50 100 150 200 300; do
+for mul_pct in 50 70 85 95 100 150 200 300; do
     MEMBW_NOPS+=($(( mul_pct * CAPACITY / 100 )))
 done
 
