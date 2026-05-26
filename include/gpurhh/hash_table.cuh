@@ -297,12 +297,20 @@ public:
         // elsewhere (typically by rebuilding a larger table).
         //
         // When GPURHH_BENCHMARK_COUNTERS is defined, takes an additional
-        // trailing reference parameter `tile_counter`. Lane 0 of the tile
-        // increments it once per bucket read (i.e. once per probe loop
-        // iteration, including CAS-retry re-reads of the same bucket).
+        // trailing reference parameter `tile_counter`. Lane 0 of the
+        // tile increments it on every cache-line-sized memory event:
+        //   - once per probe-loop iteration (the cooperative 128-byte
+        //     bucket load at the top of each iteration, including
+        //     CAS-retry re-reads of the same bucket), AND
+        //   - once per attempted CAS, whether or not it succeeds. Each
+        //     CAS attempt requires the cache line in an exclusive state
+        //     — that's an additional memory transaction beyond the
+        //     bucket load, otherwise invisible to a probes-only counter.
         // The caller is expected to pass a per-tile register accumulator
         // and flush it to a per-tile global slot at end of kernel — no
-        // atomic is involved in the increment.
+        // atomic is involved in the increment. The metric is a lower-
+        // bound estimate of cache-line transfers attributable to the
+        // insert; downstream bandwidth = counter × sizeof(Bucket) / time.
         template <class Tile>
         __device__ cuda::std::optional<Slot> insert(
             const Tile& tile, Key key, Value value
@@ -504,6 +512,13 @@ __device__ auto HashTable<K, V, H, E, R, CL, WS, MPB>::View::insert(
         // the new value is just the incoming value. Returns the broadcast
         // result of the CAS to every lane.
         auto try_cas = [&](int target_lane, bool apply_reduction) -> bool {
+            // Count this CAS attempt as one cache-line memory transaction
+            // (the atomic op requires the line in an exclusive state,
+            // beyond the cooperative bucket load above). Bumps the same
+            // tile_counter as the probe-loop top, so the metric stays a
+            // single combined cache-line-transfer count.
+            IF_GPURHH_BENCHMARK_COUNTERS(if (tile.thread_rank() == 0) ++tile_counter;)
+
             bool cas_ok = false;
             if (tile.thread_rank() == target_lane) {
                 const V to_store = apply_reduction

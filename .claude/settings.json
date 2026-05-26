@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tectonic *)",
+      "Bash(sips -s format png -s formatOptions best -Z 1400 plot.pdf --out plot_preview.png)"
+    ]
+  }
+}

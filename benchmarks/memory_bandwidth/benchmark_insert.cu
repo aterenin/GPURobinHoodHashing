@@ -4,11 +4,15 @@
 //   - Reduction operator: sum_op (exercise the reduction path).
 //   - MaxProbeBuckets: 8 (the default — study the probe-cap regime).
 //   - Per-tile probe / failure counters via GPURHH_BENCHMARK_COUNTERS.
+//     The probe counter bumps on both bucket loads and CAS attempts,
+//     so `total_probes × sizeof(Bucket) / time_ms` is a combined
+//     cache-line-transfer estimate (see View::insert's docstring).
 //
 // Writes insert.csv with the same configuration columns as the timing
-// build plus total_probes and total_failures. Lives under memory/ to
-// distinguish it from benchmarks/timing/benchmark_insert.cu, which is
-// the apples-to-apples comparison build.
+// build plus total_probes and total_failures. Lives under
+// memory_bandwidth/ to distinguish it from
+// benchmarks/timing/benchmark_insert.cu, which is the apples-to-apples
+// comparison build.
 
 #define GPURHH_BENCHMARK_COUNTERS 1
 
