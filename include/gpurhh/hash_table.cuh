@@ -1,11 +1,11 @@
 #pragma once
 
-// gpurhh — GPU Robin Hood Hash table.
+// gpurhh — GPU Robin Hood Hashing.
 //
 // Header-only CUDA library implementing a parallel hash table for NVIDIA GPUs,
 // using Robin Hood open-addressing with bucketed, sub-warp-cooperative probing.
 //
-// See the notes/ directory for the design rationale behind this layout.
+// See the docs/ directory for the design rationale behind this layout.
 //
 // The hash table itself lives in device memory. Host code constructs and
 // destructs a HashTable, which allocates and zero-initializes the slot array

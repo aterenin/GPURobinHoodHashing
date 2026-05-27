@@ -21,15 +21,15 @@ The design target is bandwidth-bound performance on large tables.
 - `benchmarks/` — split into `timing/` (apples-to-apples library throughput vs. cuCollections and WarpCore) and `memory_bandwidth/` (counter-instrumented gpurhh study + memcpy ceiling reference).
   Run via `scripts/benchmark.sh`; output lands under `output/<timestamp>/`.
   `external/` (gitignored) holds the sparse-checkout of baseline headers; populate with `scripts/setup-baselines.sh`.
-- `notes/` — design notes, written for humans.
-  These files are the canonical record of *why* the implementation looks the way it does.
-  They are intended to eventually become the project's documentation, but they are not documentation yet — they are working notes that capture decisions as we make them.
+- `docs/` — design documentation, written for humans.
+  These files are the canonical record of *why* the implementation looks the way it does, split into thematic pages (`index.md`, `usage.md`, `architecture.md`, `algorithm.md`, `implementation.md`, `testing.md`, `benchmarks.md`, `limitations.md`).
+  The C++ API reference is produced separately by Doxygen from the headers themselves.
   Read these before touching code.
 - `Makefile` — builds tests, examples, and benchmarks with `nvcc`. Defaults to C++20, `sm_89`, and no optimization for tests/examples; `-O3` for benchmarks (since unoptimized throughput numbers are meaningless).
   Targets: `make` (= `make all` — tests + examples + benchmarks), `make tests`, `make examples`, `make benchmarks`, `make test` (build + run all tests), `make clean`.
   Override flags via env vars (`make ARCH=sm_90 CXX_STD=c++17 OPT=-O3`); benchmark binaries always build at `-O3` regardless of `OPT`.
 
-When new design decisions are made or revised, update the relevant note in `notes/` rather than scattering rationale across commit messages or code comments.
+When new design decisions are made or revised, update the relevant page in `docs/` rather than scattering rationale across commit messages or code comments.
 
 ## Conventions for working in this repo
 

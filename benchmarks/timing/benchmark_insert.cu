@@ -20,7 +20,7 @@
 //   - Keys drawn from Uniform(0, 2^32) — i.e. raw cuRAND output, no
 //     clamping. With capacity 2^27 this gives α ≈ 32 (essentially
 //     unique-keys), which is the regime where collision-resolution
-//     strategy actually matters. See notes/design.md for the α=1
+//     strategy actually matters. See docs/benchmarks.md for the α=1
 //     duplicate-stress alternative.
 //   - Single ~1 GiB table by default, DRAM-resident.
 //

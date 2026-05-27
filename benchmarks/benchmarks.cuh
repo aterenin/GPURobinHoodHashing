@@ -173,7 +173,7 @@ private:
 // keys are effectively unique, and we are squarely in the collision-
 // resolution regime where table designs differ. If you instead want to
 // stress the duplicate-collapse / reduction path (α ≈ 1, ~63% peak
-// occupancy), see the note in notes/design.md — restoring that mode
+// occupancy), see the note in docs/benchmarks.md — restoring that mode
 // takes ~30 lines (a small clamp kernel plus a --key-range flag).
 inline void fill_uniform_keys(
     std::uint32_t* d_out, std::size_t n, UniformKeyGenerator& gen)

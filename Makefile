@@ -97,7 +97,7 @@ BENCHMARK_BINS   := $(patsubst benchmarks/%.cu,$(BUILD)/benchmarks/%,$(BENCHMARK
 # small project; revisit if compile times become an issue.
 ALL_HEADERS := $(shell find include tests benchmarks -name "*.cuh" 2>/dev/null)
 
-.PHONY: all tests examples benchmarks test clean
+.PHONY: all tests examples benchmarks test docs clean
 
 all: tests examples benchmarks
 
@@ -107,6 +107,12 @@ benchmarks: $(BENCHMARK_BINS)
 
 test: $(TEST_BINS)
 	@set -e; for t in $(TEST_BINS); do echo "==> $$t"; "$$t"; done
+
+# HTML documentation. Combines the hand-written design pages under
+# docs/ with the API reference extracted from include/gpurhh/ by
+# Doxygen. Output lands in build/docs/html/; open index.html.
+docs:
+	doxygen Doxyfile
 
 $(BUILD)/tests/%: tests/%.cu $(ALL_HEADERS)
 	@mkdir -p $(BUILD)/tests

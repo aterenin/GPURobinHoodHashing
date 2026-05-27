@@ -1,0 +1,58 @@
+# Doxygen configuration for gpurhh.
+#
+# Inputs:
+#   - docs/                      (hand-written design pages; index.md is the main page)
+#   - include/gpurhh/            (the public headers — API reference)
+#
+# The repo-root README.md is GitHub-facing only and is deliberately not
+# included here. *.md in FILE_PATTERNS is scoped to the INPUT paths, so
+# only docs/*.md is picked up (there are no .md files under include/).
+#
+# HTML output lands in build/docs/html/. Build with `make docs` or
+# `doxygen Doxyfile` from the repo root.
+
+PROJECT_NAME           = "gpurhh"
+PROJECT_BRIEF          = "GPU Robin Hood Hashing — header-only CUDA library"
+OUTPUT_DIRECTORY       = build/docs
+
+INPUT                  = docs include/gpurhh
+FILE_PATTERNS          = *.cuh *.md
+RECURSIVE              = YES
+USE_MDFILE_AS_MAINPAGE = docs/index.md
+
+EXAMPLE_PATH           = examples
+EXAMPLE_PATTERNS       = *.cu
+
+# The headers use plain // comments rather than Doxygen markup. Extract
+# everything we have and let JAVADOC_AUTOBRIEF lift the first sentence
+# of each block comment into the brief.
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+JAVADOC_AUTOBRIEF      = YES
+
+MARKDOWN_SUPPORT       = YES
+AUTOLINK_SUPPORT       = YES
+
+# Treat .cuh / .cu as C++ so Doxygen parses them with the C++ frontend.
+EXTENSION_MAPPING      = cuh=C++ cu=C++
+
+# Strip CUDA attribute macros so they don't confuse the parser.
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             = __device__= \
+                         __host__= \
+                         __global__= \
+                         __forceinline__=inline \
+                         __CUDACC__ \
+                         __NVCC__
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+GENERATE_LATEX         = NO
+GENERATE_XML           = NO
+
+QUIET                  = YES
+WARN_IF_UNDOCUMENTED   = NO
+HAVE_DOT               = NO

@@ -1,0 +1,67 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'include/**'
+      - 'README.md'
+      - 'Doxyfile'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'include/**'
+      - 'README.md'
+      - 'Doxyfile'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; don't cancel an in-flight run.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y doxygen
+
+      - name: Build HTML
+        run: |
+          mkdir -p build/docs
+          doxygen Doxyfile
+
+      # GitHub Pages serves with Jekyll by default, which skips files
+      # whose names start with an underscore. Doxygen emits some, so
+      # opt out of Jekyll.
+      - name: Disable Jekyll
+        run: touch build/docs/html/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/docs/html
+
+  deploy:
+    # Only deploy on pushes to main (and manual dispatch); PRs just build.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
