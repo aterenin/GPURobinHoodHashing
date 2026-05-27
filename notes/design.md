@@ -375,7 +375,7 @@ The test suite runs about 35 tests across ~1100 lines of code, against ~350 line
 
 Throughput and instrumentation measurements live in `benchmarks/`, split into two studies with their own directory subtree and their own CSV output tree.
 
-- **`benchmarks/timing/`** — apples-to-apples kernel throughput against optional baselines (`cuCollections::static_map`, `WarpCore::SingleValueHashTable`). gpurhh's binaries here use `replace_op` reduction and `MaxProbeBuckets = 1 << 20` (effectively uncapped), matching the baselines' unbounded-probe semantics. Two executables: `benchmark_insert`, `benchmark_get`. Baseline equivalents live under `benchmarks/timing/baselines/{cuco,warpcore}/` and append to the same per-workload CSVs; the `library` column distinguishes their rows.
+- **`benchmarks/timing/`** — apples-to-apples kernel throughput against optional baselines (`cuCollections::static_map`, `WarpCore::SingleValueHashTable`). gpurhh's binaries here use `replace_op` reduction and `MaxProbeBuckets = 1 << 20` (effectively uncapped), matching the baselines' unbounded-probe semantics. Two executables: `benchmark_insert`, `benchmark_get`. Baseline equivalents live under `benchmarks/timing/baselines/{cuco,cuco_dh,warpcore}/` and append to the same per-workload CSVs; the `library` column distinguishes their rows. The `cuco/` baseline uses cuCollections's default linear probing (CG=4); the `cuco_dh/` baseline reuses the same headers but specializes `static_map` with `double_hashing<8, ...>`, isolating the probing-scheme variable within a single library so the family-vs-implementation axis is testable separately.
 - **`benchmarks/memory_bandwidth/`** — the bandwidth study. `benchmark_memcpy` provides the empirical DRAM ceiling; `benchmark_insert` and `benchmark_get` are gpurhh's design under instrumentation (`sum_op` reduction, default `MaxProbeBuckets = 8`, per-tile probe / failure / hit counters via `GPURHH_BENCHMARK_COUNTERS`). The CSVs from this study let you compute precise per-op DRAM traffic — `total_probes × sizeof(Bucket) / time_ms` — and compare it against memcpy's ceiling. No library baselines, since neither cuco nor warpcore exposes the per-probe counters needed for the bandwidth analysis.
 
 The split exists because the two studies want fundamentally different configurations: timing needs the most permissive probe behavior to make per-library performance comparable; the bandwidth study wants the design's actual default (capped probes, real reduction work) so we can read the probe / failure / hit characteristics back out and convert them into bandwidth numbers.
@@ -432,7 +432,8 @@ At low F the corrected and uncorrected throughput numbers converge (average prob
 
 - `--timing` — gpurhh's timing sweep (insert + get).
 - `--memory-bandwidth` — the bandwidth sweep (memcpy ceiling + counter-instrumented gpurhh insert + get).
-- `--cuco` — cuCollections baseline (timing only).
+- `--cuco` — cuCollections baseline, default linear probing (timing only).
+- `--cuco-dh` — cuCollections baseline re-specialized with double hashing (timing only).
 - `--warpcore` — WarpCore baseline (timing only).
 - `--all` — every flag above; missing binaries are skipped with a notice rather than erroring.
 

@@ -80,7 +80,12 @@ HAVE_CUCO     := $(wildcard $(EXTERNAL_INCLUDE)/cuco)
 HAVE_WARPCORE := $(wildcard $(EXTERNAL_INCLUDE)/warpcore)
 
 ifneq ($(HAVE_CUCO),)
+    # cuco/      — static_map with its default linear_probing<4>.
+    # cuco_dh/   — same headers, static_map specialized with
+    #              double_hashing<8> so we can isolate the probing-scheme
+    #              variable from everything else cuco does.
     BENCHMARK_SRCS += $(wildcard benchmarks/timing/baselines/cuco/benchmark_*.cu)
+    BENCHMARK_SRCS += $(wildcard benchmarks/timing/baselines/cuco_dh/benchmark_*.cu)
 endif
 ifneq ($(HAVE_WARPCORE),)
     BENCHMARK_SRCS += $(wildcard benchmarks/timing/baselines/warpcore/benchmark_*.cu)

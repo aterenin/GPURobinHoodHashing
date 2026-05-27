@@ -32,7 +32,12 @@
 #   --timing             Run gpurhh's timing sweep (insert + get).
 #   --memory-bandwidth   Run the bandwidth sweep (memcpy ceiling +
 #                        counter-instrumented gpurhh insert + get).
-#   --cuco               Run the cuCollections baseline (timing only).
+#   --cuco               Run the cuCollections baseline (linear probing
+#                        CG=4, the static_map default). Timing only.
+#   --cuco-dh            Run the cuCollections baseline with static_map
+#                        re-specialized to double hashing CG=8. Same
+#                        codebase as --cuco, only the probing scheme
+#                        differs. Timing only.
 #   --warpcore           Run the WarpCore baseline (timing only).
 #   --all                Shortcut for every flag above; missing binaries
 #                        are skipped with a notice rather than erroring.
@@ -51,6 +56,7 @@ print_usage() {
 RUN_TIMING=0
 RUN_MEMBW=0
 RUN_CUCO=0
+RUN_CUCO_DH=0
 RUN_WARPCORE=0
 LENIENT=0
 POSITIONAL=()
@@ -59,9 +65,11 @@ while [[ $# -gt 0 ]]; do
         --timing)            RUN_TIMING=1;   shift ;;
         --memory-bandwidth)  RUN_MEMBW=1;    shift ;;
         --cuco)              RUN_CUCO=1;     shift ;;
+        --cuco-dh)           RUN_CUCO_DH=1;  shift ;;
         --warpcore)          RUN_WARPCORE=1; shift ;;
         --all)               RUN_TIMING=1; RUN_MEMBW=1
-                             RUN_CUCO=1;   RUN_WARPCORE=1
+                             RUN_CUCO=1;   RUN_CUCO_DH=1
+                             RUN_WARPCORE=1
                              LENIENT=1;     shift ;;
         --help|-h)           print_usage; exit 0 ;;
         --*)
@@ -74,7 +82,7 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${POSITIONAL[@]}"
 
-if [[ $((RUN_TIMING + RUN_MEMBW + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
+if [[ $((RUN_TIMING + RUN_MEMBW + RUN_CUCO + RUN_CUCO_DH + RUN_WARPCORE)) -eq 0 ]]; then
     print_usage >&2
     exit 1
 fi
@@ -84,6 +92,7 @@ BUILD_DIR="${REPO_ROOT}/build/benchmarks"
 TIMING_BIN="${BUILD_DIR}/timing"
 MEMBW_BIN="${BUILD_DIR}/memory_bandwidth"
 CUCO_BIN="${TIMING_BIN}/baselines/cuco"
+CUCO_DH_BIN="${TIMING_BIN}/baselines/cuco_dh"
 WARPCORE_BIN="${TIMING_BIN}/baselines/warpcore"
 
 if [[ $# -ge 1 ]]; then
@@ -133,6 +142,12 @@ if [[ "${RUN_CUCO}" -eq 1 ]]; then
         "${CUCO_BIN}/benchmark_get" \
         || RUN_CUCO=0
 fi
+if [[ "${RUN_CUCO_DH}" -eq 1 ]]; then
+    require_or_drop "cuco_dh" \
+        "${CUCO_DH_BIN}/benchmark_insert" \
+        "${CUCO_DH_BIN}/benchmark_get" \
+        || RUN_CUCO_DH=0
+fi
 if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
     require_or_drop "warpcore" \
         "${WARPCORE_BIN}/benchmark_insert" \
@@ -140,7 +155,7 @@ if [[ "${RUN_WARPCORE}" -eq 1 ]]; then
         || RUN_WARPCORE=0
 fi
 
-if [[ $((RUN_TIMING + RUN_MEMBW + RUN_CUCO + RUN_WARPCORE)) -eq 0 ]]; then
+if [[ $((RUN_TIMING + RUN_MEMBW + RUN_CUCO + RUN_CUCO_DH + RUN_WARPCORE)) -eq 0 ]]; then
     echo "Nothing to run." >&2
     exit 1
 fi
@@ -189,7 +204,7 @@ SEED=1
 # Multipliers are expressed as integer percentages of capacity so we can
 # stay in bash arithmetic; e.g. 85 means F = 0.85.
 TIMING_NOPS=()
-for mul_pct in 50 70 85 95 100; do
+for mul_pct in 50 75 85 95 100; do
     TIMING_NOPS+=($(( mul_pct * CAPACITY / 100 )))
 done
 
@@ -202,7 +217,7 @@ done
 # with timing panels at low F) and then extend into the F > 1
 # over-subscription regime where failure counters become informative.
 MEMBW_NOPS=()
-for mul_pct in 50 70 85 95 100 150 200 300; do
+for mul_pct in 50 75 85 95 100 150 200 300; do
     MEMBW_NOPS+=($(( mul_pct * CAPACITY / 100 )))
 done
 
@@ -286,6 +301,29 @@ if [[ "${RUN_CUCO}" -eq 1 ]]; then
 
         echo "==> cuco get    n_ops=${n_ops}"
         "${CUCO_BIN}/benchmark_get" \
+            --output-dir "${TIMING_OUT}" \
+            --capacity "${CAPACITY}" \
+            --n-ops "${n_ops}" \
+            --reps "${REPS}" \
+            --seed "${SEED}" \
+            --tag "${TAG}"
+    done
+fi
+
+# --- cuCollections + double hashing (timing only) ------------------------
+if [[ "${RUN_CUCO_DH}" -eq 1 ]]; then
+    for n_ops in "${TIMING_NOPS[@]}"; do
+        echo "==> cuco_dh insert n_ops=${n_ops}"
+        "${CUCO_DH_BIN}/benchmark_insert" \
+            --output-dir "${TIMING_OUT}" \
+            --capacity "${CAPACITY}" \
+            --n-ops "${n_ops}" \
+            --reps "${REPS}" \
+            --seed "${SEED}" \
+            --tag "${TAG}"
+
+        echo "==> cuco_dh get    n_ops=${n_ops}"
+        "${CUCO_DH_BIN}/benchmark_get" \
             --output-dir "${TIMING_OUT}" \
             --capacity "${CAPACITY}" \
             --n-ops "${n_ops}" \
