@@ -71,9 +71,9 @@ Storing it would cost bits we'd rather give to the payload, and the derivation i
 ## Capacity, hash function, load factor
 
 - Capacity is a power of two so `mod` becomes a mask.
-  Users specify a target load factor (default 0.7); we round capacity up to `next_pow2(N / load_factor)`.
+  The constructor takes `min_capacity` (in slots) and rounds up to the next power of two, never below `bucket_size`. Users targeting a specific load factor compute the slot count themselves (e.g. `min_capacity = ceil(N / target_load_factor)` for an expected `N` insertions).
 - Hash function is a template parameter; default is a finalizer-style mixer (e.g. the splitmix64/Murmur3 finalizer) that is cheap on GPU and decorrelates structured keys well.
-- Robin Hood tolerates higher load than linear probing, but on a GPU the warp tail-latency argument pushes us back toward 0.7–0.8 rather than 0.9.
+- Robin Hood tolerates higher load than linear probing, but on a GPU the warp tail-latency argument pushes the practical sweet spot back toward 0.7–0.8 rather than 0.9.
 
 ### Where the power-of-two assumption is load-bearing
 
@@ -156,7 +156,7 @@ The bandwidth strategy follows from this:
   Exposed as a `MaxProbeBuckets` template parameter (default 8).
   An insert that would place a key past the cap fails (the caller is expected to rehash); a get that probes the cap without finding the key returns "not found" (correct because of the insert-side cap).
   With Robin Hood at load factor ~0.85 and `bucket_size` 16, the expected longest probe is well under the default cap; the cap protects against adversarial inputs and very high load factors.
-  Empirically, on uniform-random keys with α=1, the default cap-8 budget handles input load factor F ≤ 2 (≈ 80% slot occupancy) with zero failures, and starts losing about 0.1% of inserts at F = 3 (≈ 95% occupancy) — a real but small number that callers can either tolerate, drop (cf. lossy-storage workloads), or recover by buffering the leftover Slots and replaying into a larger table.
+  Empirically, on `Uniform(0, 2^32)` uint32 keys (effectively unique inputs), the default cap-8 budget handles `F = n_ops / capacity` up to ~1 with essentially zero failures, and starts losing inserts as `F` grows past 1 into the over-subscription regime (see `benchmarks/memory_bandwidth/insert.csv`'s `total_failures` column).
   Crucially, a failing insert hands the leftover `(key, value)` back to the caller via the return value rather than dropping it on the floor.
   This matters because the leftover may not be the original input: if Robin Hood displacements happened during the probe, the originally-passed-in pair is already in the table and the leftover is the most-recently-evicted victim.
   Returning it is what makes the operation lossless under failure — callers can buffer leftovers and replay them into a rebuilt larger table.
@@ -344,7 +344,7 @@ void print_slots(const Table& table, std::size_t start, std::size_t stop);
 
 One macro gates functionality that the core library doesn't expose by default. It must be defined in the translation unit *before* any `<gpurhh/...>` header is included:
 
-- **`GPURHH_BENCHMARK_COUNTERS`** adds a trailing `std::uint32_t& tile_counter` parameter to `View::insert` and `View::get`. Lane 0 of the tile increments it on every bucket-load (a CAS-retry re-read counts too — it's a real DRAM transaction). The caller maintains a per-tile register accumulator and writes it out once at end of kernel; no atomics are involved in the probing hot loop. The memory-bandwidth benchmark binaries enable this; the timing benchmarks, tests, and the example do not.
+- **`GPURHH_BENCHMARK_COUNTERS`** adds a trailing `std::uint32_t& tile_counter` parameter to `View::insert` and `View::get`. Lane 0 of the tile increments it on every cache-line-sized memory event: each bucket-load at the top of a probe-loop iteration (including CAS-retry re-reads of the same bucket), *and* each attempted CAS — every CAS requires the line in an exclusive state, which is an additional memory transaction beyond the cooperative load. `View::get` is read-only and only bumps on bucket loads. The caller maintains a per-tile register accumulator and writes it out once at end of kernel; no atomics fire in the hot loop. Downstream bandwidth = `counter × sizeof(Bucket) / time`. The memory-bandwidth benchmark binaries enable this; the timing benchmarks, tests, and the example do not.
 
 The `View` is the centerpiece for header-only use: a user kernel that already has its keys in registers calls `view.insert(tile, ...)` or `view.get(tile, ...)` directly.
 Bulk host-side operations are deliberately *not* part of the table — callers manage their device buffers and write their own driver kernels.
@@ -369,7 +369,7 @@ Three shared infrastructure headers:
 
 The `IdentityHash` is the enabling choice for the isolated tests: with `hash(K) = K`, the home bucket of a key is fully predictable from its value, so we can construct any valid Robin Hood state with one `cudaMemcpy` and hand-predict the outcome of small insert sequences. The randomized tests apply a bit-mixing function (the same `fmix32` finalizer used by `default_hash`) as a permutation on sequential integers — this gives distinct random-looking keys without the host-side dedup overhead that an `unordered_set` would require, which is what makes the gigabyte-scale tests fit in memory.
 
-The test suite runs about 35 tests across ~1100 lines of code, against ~350 lines of library code. The high ratio is deliberate: this is a concurrent data structure, and the failure modes for concurrent CAS retries, displacement chains, and probe-cap interactions are subtle enough that we put significant effort into checking each path.
+The test suite runs about 40 tests across ~1500 lines of test code (plus ~500 lines of shared test infrastructure under `tests.cuh`/`kernels.cuh`/`isolated.cuh`), against ~750 lines of library code under `include/gpurhh/`. The high ratio is deliberate: this is a concurrent data structure, and the failure modes for concurrent CAS retries, displacement chains, and probe-cap interactions are subtle enough that we put significant effort into checking each path.
 
 ## Benchmarking
 
@@ -386,7 +386,7 @@ The split exists because the two studies want fundamentally different configurat
 
 - **`capacity`** is held at 1 GiB by default — well past the L2 cache on any sm_89 device, putting the kernel firmly in the DRAM-bound regime.
 - **Key distribution** is raw `Uniform(0, 2^32)` — every uint32 is equally likely, no clamping. With capacity = 2^27, this gives `α = key_range / capacity ≈ 32`: keys are effectively unique. This is the collision-resolution regime where table designs actually differ; at much smaller α the table fills very slowly with duplicates and linear probing's pathological clustering never engages.
-- **`F = n_ops / capacity`** is the swept axis. The grid is `F ∈ {0.5, 0.7, 0.85, 0.95, 1.0, 1.5, 2.0, 3.0}`. With α ≈ 32, effective occupancy ≈ F up to ~0.97, so F = 0.9–1.0 is the high-occupancy regime where Robin Hood's variance reduction matters; F > 1 over-subscribes the table (more unique keys than slots) and the sweep measures how each library degrades — both throughput (`time_ms`) and how many of those keys actually landed (`n_unique` and `drops`).
+- **`F = n_ops / capacity`** is the swept axis. The timing sweep uses `F ∈ {0.5, 0.75, 0.85, 0.95, 1.0}` — capped at F=1 because gpurhh's timing build sets `MaxProbeBuckets = 1 << 20` (matching the baselines' effectively-unbounded probing), and at F > 1 with α ≈ 32 each doomed insert would walk its full probe budget, turning the sweep into a multi-hour stall. A redraw guard in the timing-insert binary aborts if a cuRAND draw produces `n_unique > capacity` after a few retries. The memory-bandwidth sweep extends through `F ∈ {0.5, 0.75, 0.85, 0.95, 1.0, 1.5, 2.0, 3.0}` — with `MaxProbeBuckets = 8` (the design default) failed inserts give up cheaply, so the over-subscription regime is tractable and the failure / hit / probe counters become informative.
 - **`block_size ∈ {64, 128, 256, 512, 1024}`** is swept for the gpurhh binaries to spot-check that launch shape doesn't dominate. cuco / warpcore pick their own internal launch shapes.
 
 ### Experiment phases
@@ -457,6 +457,6 @@ Output goes to `output/<timestamp>/timing/{insert,get}.csv` and `output/<timesta
 ## Future work
 
 - Validate the 128-bit slot path on a Hopper (sm_90+) system; benchmark it against the 64-bit path.
-- Benchmark against `cuCollections` and `WarpCore` on the same workloads to validate the bandwidth-bound claim. Pinned commits for both are inlined in `scripts/setup-baselines.sh`, which clones each upstream with a sparse-checkout of just the `include/` subtree into `external/<lib>/`. `external/` itself is gitignored, so downstream users of `gpurhh` who recursively clone aren't forced to pull benchmark-only dependencies.
 - Add a CPU reference Robin Hood for randomized differential testing if test signal demands it (currently considered low priority — the invariant scanner plus the sum-reduction equivalence check cover most of what differential testing would add).
 - Implement deletion (backward-shift, lock-free) if a use case appears.
+- Consider the inner-loop "exhaust all empty / displaceable slots in the current bucket snapshot before re-reading" optimization (warpcore-style). Sketched, prototyped, and measured to be performance-neutral at our scale (low CAS contention dominates); kept on the back burner in case the contention profile shifts.

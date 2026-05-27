@@ -15,16 +15,19 @@ The design target is bandwidth-bound performance on large tables.
   The library is header-only; everything ships from here.
 - `tests/` — tests built against the public header.
   Each `test_*.cu` file is compiled as its own executable with its own `main`, scoped to one topic (a public method, a trait, etc.).
-  Shared driver kernels, table aliases, and host-side bulk helpers live in `tests/kernels.cuh`; the CUDA error-check operator and other test-wide infrastructure (including the macro that exposes `HashTable::data()`) live in `tests/tests.cuh`.
+  Shared driver kernels, table aliases, and host-side bulk helpers live in `tests/kernels.cuh`; the CUDA error-check operator lives in `tests/tests.cuh`; `tests/isolated.cuh` provides the `IdentityHash`-based fixture that lets tests hand-build and verify Robin Hood states.
 - `examples/` — small standalone programs demonstrating use of the library.
-  Currently a placeholder; to be filled in with a real construct + bulk insert + bulk lookup demo.
+  `examples/basic.cu` is a self-contained construct + bulk insert + bulk lookup + pretty-print walkthrough.
+- `benchmarks/` — split into `timing/` (apples-to-apples library throughput vs. cuCollections and WarpCore) and `memory_bandwidth/` (counter-instrumented gpurhh study + memcpy ceiling reference).
+  Run via `scripts/benchmark.sh`; output lands under `output/<timestamp>/`.
+  `external/` (gitignored) holds the sparse-checkout of baseline headers; populate with `scripts/setup-baselines.sh`.
 - `notes/` — design notes, written for humans.
   These files are the canonical record of *why* the implementation looks the way it does.
   They are intended to eventually become the project's documentation, but they are not documentation yet — they are working notes that capture decisions as we make them.
   Read these before touching code.
-- `Makefile` — builds tests and examples with `nvcc`. Defaults to C++20, `sm_89`, and no optimization.
-  Build modes: `make` (no `-O`), `make release` (`-O3`), `make debug` (`-O0 -G -g`).
-  Other useful targets: `make test` builds and runs all tests, `make clean` wipes `build/`. Override flags via env vars (`make ARCH=sm_90 CXX_STD=c++17`).
+- `Makefile` — builds tests, examples, and benchmarks with `nvcc`. Defaults to C++20, `sm_89`, and no optimization for tests/examples; `-O3` for benchmarks (since unoptimized throughput numbers are meaningless).
+  Targets: `make` (= `make all` — tests + examples + benchmarks), `make tests`, `make examples`, `make benchmarks`, `make test` (build + run all tests), `make clean`.
+  Override flags via env vars (`make ARCH=sm_90 CXX_STD=c++17 OPT=-O3`); benchmark binaries always build at `-O3` regardless of `OPT`.
 
 When new design decisions are made or revised, update the relevant note in `notes/` rather than scattering rationale across commit messages or code comments.
 
