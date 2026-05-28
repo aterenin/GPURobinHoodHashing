@@ -12,11 +12,13 @@ U                       b       o       s
                                         g
 ```
 
-[![Docs](https://img.shields.io/badge/docs-design%20notes-blue)](docs/index.md)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Docs](https://img.shields.io/badge/Doxygen-Documentation-blue)](https://aterenin.github.io/GPURobinHoodHashing/)
+[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
 A header-only CUDA library implementing a parallel hash table for NVIDIA GPUs, using Robin Hood open-addressing with bucketed (cache-line-aligned), sub-warp-cooperative probing.
 The design target is bandwidth-bound performance on large tables.
+
+Check out my [recent blog post](https://avt.im/blog/sculpting-fragile-glass/) about this codebase. This includes performance benchmarks that show strong performance against cuCollections and WarpCore baselines for retrieval at sufficient load factors, along with information about how it was built.
 
 # Status
 
